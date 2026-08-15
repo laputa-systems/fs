@@ -7,6 +7,54 @@
 
 use rustix::fd::AsFd;
 use rustix::io::Errno;
+use std::sync::OnceLock;
+
+/// BLAKE3's parallel update has measurable setup/scheduling overhead.  Keep
+/// the threshold explicit so it can be benchmarked on each supported CPU;
+/// this is intentionally not a per-file heuristic.
+pub(crate) const RAYON_UPDATE_THRESHOLD: usize = 256 * 1024;
+
+/// There is one bounded pool for all hash work in an invocation.  In
+/// particular, workers never construct a pool while hashing a file.  The
+/// upper bound also prevents a high `-j` copy run from creating an
+/// unbounded second layer of CPU workers.
+const MAX_HASH_THREADS: usize = 8;
+
+static HASH_POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+
+fn hash_pool() -> Option<&'static rayon::ThreadPool> {
+    HASH_POOL
+        .get_or_init(|| {
+            let threads = std::thread::available_parallelism()
+                .map(|parallelism| parallelism.get().clamp(1, MAX_HASH_THREADS))
+                .unwrap_or(1);
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .thread_name(|index| format!("fs-hash-{index}"))
+                .build()
+                .ok()
+        })
+        .as_ref()
+}
+
+fn update_hasher(hasher: &mut blake3::Hasher, chunk: &[u8]) {
+    if chunk.len() < RAYON_UPDATE_THRESHOLD {
+        hasher.update(chunk);
+        return;
+    }
+
+    // `update_rayon` uses the current Rayon context. Installing it into the
+    // singleton pool makes the pool boundary explicit and prevents a new
+    // pool from being created per file or per chunk. A pool construction
+    // failure is not a correctness failure; serial BLAKE3 is equivalent.
+    if let Some(pool) = hash_pool() {
+        pool.install(|| {
+            hasher.update_rayon(chunk);
+        });
+    } else {
+        hasher.update(chunk);
+    }
+}
 
 /// Hash exactly `size` bytes from the current position of `fd`.
 ///
@@ -38,7 +86,7 @@ pub(crate) fn hash_fd<Fd: AsFd>(
             });
         }
 
-        hasher.update(&scratch[..read]);
+        update_hasher(&mut hasher, &scratch[..read]);
         remaining -= read as u64;
     }
 
@@ -109,6 +157,20 @@ mod tests {
         assert!(matches!(error, HashError::UnexpectedEof { .. }));
     }
 
+    #[test]
+    fn thresholded_parallel_updates_match_serial_blake3() {
+        let mut file = tempfile_for_test();
+        let contents = vec![0x5a_u8; RAYON_UPDATE_THRESHOLD + 17];
+        file.write_all(&contents).expect("write test contents");
+        file.flush().expect("flush test contents");
+        file.rewind().expect("rewind test file");
+
+        let mut scratch = vec![0_u8; contents.len()];
+        let actual = hash_fd(file.as_fd(), contents.len() as u64, &mut scratch)
+            .expect("hash should succeed");
+        assert_eq!(actual, blake3::hash(&contents));
+    }
+
     fn tempfile_for_test() -> std::fs::File {
         use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -123,7 +185,7 @@ mod tests {
             .read(true)
             .write(true)
             .open(&path)
-            .inspect(|file| {
+            .inspect(|_file| {
                 // Keep the fixture self-cleaning without requiring a temp-file
                 // dependency in the production crate.
                 let _ = std::fs::remove_file(path);

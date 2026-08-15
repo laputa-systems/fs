@@ -179,9 +179,10 @@ pub(crate) fn open_directory_with_policy<Fd: AsFd>(
         return Err(DeleteError::ConcurrentChange);
     }
     if let Some(expected) = expected
-        && !observed.same_object(expected) {
-            return Err(DeleteError::ConcurrentChange);
-        }
+        && !observed.same_object(expected)
+    {
+        return Err(DeleteError::ConcurrentChange);
+    }
     let fd = traverse::open_child_directory(&parent, name, policy)?;
     let opened = fd.stamp();
     if !opened.same_object(observed) {
@@ -236,10 +237,11 @@ fn delete_contents(
     }
 
     // Enumeration borrows only the held directory FD. Directory stream type
-    // bits are advisory; every entry is restatted below.
-    let entries = traverse::enumerate(directory)?;
-
-    for entry in entries {
+    // bits are advisory; every entry is restatted below. The stream is
+    // bounded: it retains only the current entry rather than materializing an
+    // entire directory in memory.
+    let mut entries = traverse::DirectoryEntries::open(directory)?;
+    while let Some(entry) = entries.next_entry()? {
         let observed = match stamp_at_with_policy(directory, &entry.name, policy) {
             Ok(stamp) => stamp,
             Err(DeleteError::Io(error)) if error == Errno::NOENT => continue,

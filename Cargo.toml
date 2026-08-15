@@ -6,9 +6,10 @@ description = "A small, safe, fast filesystem convergence tool"
 license = "MIT"
 
 [dependencies]
-blake3 = "1"
+blake3 = { version = "1", features = ["rayon"] }
 libc = "0.2"
 lexopt = "0.3"
+rayon = "1"
 rustix = { version = "1", features = ["fs", "process", "stdio", "termios"] }
 
 [profile.dev]

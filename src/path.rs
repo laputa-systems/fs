@@ -76,7 +76,6 @@ pub(crate) struct EstablishedRoot {
     pub(crate) parent_fd: OwnedFd,
     pub(crate) leaf: OsString,
     pub(crate) metadata: Option<EntryMetadata>,
-    pub(crate) exists: bool,
     pub(crate) input: OsString,
 }
 
@@ -193,7 +192,6 @@ fn establish(path: &OsStr, allow_absent_final: bool, operation: &str) -> Result<
     Ok(EstablishedRoot {
         parent_fd: parent,
         leaf,
-        exists: metadata.is_some(),
         metadata,
         input: path.to_os_string(),
     })
@@ -353,7 +351,7 @@ mod tests {
         fs::create_dir(&parent).unwrap();
 
         let absent = establish_destination(parent.join("new").as_os_str()).unwrap();
-        assert!(!absent.exists);
+        assert!(absent.metadata().is_none());
         assert_eq!(absent.leaf(), OsStr::new("new"));
         assert!(establish_destination(base.join("missing/new").as_os_str()).is_err());
 

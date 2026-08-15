@@ -1,52 +1,23 @@
 //! Integration coverage for bounded concurrency and atomic publication.
 
 use std::fs;
-use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
-static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+mod support;
 
-struct Fixture {
-    root: std::path::PathBuf,
-}
-
-impl Fixture {
-    fn new() -> Self {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let counter = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::current_dir()
-            .expect("workspace cwd")
-            .join(format!(
-                ".fs-concurrency-test-{}-{nonce}-{counter}",
-                std::process::id()
-            ));
-        fs::create_dir(&root).expect("create fixture");
-        Self { root }
-    }
-}
-
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.root);
-    }
-}
+use support::TestDir as Fixture;
 
 #[test]
 fn concurrent_readers_observe_only_complete_old_or_new_publications() {
     let fixture = Fixture::new();
-    let source = fixture.root.join("source");
-    let destination = fixture.root.join("destination");
+    let source = fixture.root().join("source");
+    let destination = fixture.root().join("destination");
     let old = vec![b'o'; 4 * 1024 * 1024];
     let new = vec![b'n'; 4 * 1024 * 1024];
     fs::write(&source, &new).expect("write source");
     fs::write(&destination, &old).expect("write destination");
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_fs"))
-        .current_dir(&fixture.root)
+    let mut child = fixture
+        .command()
         .args(["cp", "--no-progress", "source", "destination"])
         .spawn()
         .expect("spawn fs");
@@ -72,8 +43,8 @@ fn concurrent_readers_observe_only_complete_old_or_new_publications() {
 #[test]
 fn bounded_workers_converge_many_regular_files() {
     let fixture = Fixture::new();
-    let source = fixture.root.join("source");
-    let destination = fixture.root.join("destination");
+    let source = fixture.root().join("source");
+    let destination = fixture.root().join("destination");
     fs::create_dir(&source).expect("create source");
     for index in 0..128 {
         fs::write(
@@ -83,8 +54,8 @@ fn bounded_workers_converge_many_regular_files() {
         .expect("write source entry");
     }
 
-    let status = Command::new(env!("CARGO_BIN_EXE_fs"))
-        .current_dir(&fixture.root)
+    let status = fixture
+        .command()
         .args(["cp", "--no-progress", "-j", "4", "source", "destination"])
         .status()
         .expect("run fs");

@@ -167,7 +167,7 @@ mod tests {
             .read(true)
             .write(true)
             .open(&path)
-            .inspect(|file| {
+            .inspect(|_file| {
                 let _ = std::fs::remove_file(path);
             })
             .unwrap()
@@ -211,7 +211,7 @@ mod tests {
                 source_stamp,
                 destination_stamp,
                 CheckMode::Metadata,
-                TimestampResolution::NANOS,
+                TimestampResolution::known(1).unwrap(),
                 &mut scratch,
             )
             .unwrap(),
@@ -234,7 +234,7 @@ mod tests {
                 source_stamp,
                 destination_stamp,
                 CheckMode::Hash,
-                TimestampResolution::NANOS,
+                TimestampResolution::known(1).unwrap(),
                 &mut scratch,
             )
             .unwrap(),
@@ -267,7 +267,7 @@ mod tests {
                 stamp,
                 regular,
                 CheckMode::Metadata,
-                TimestampResolution::NANOS,
+                TimestampResolution::known(1).unwrap(),
                 &mut scratch,
             ),
             Err(CompareError::NotRegular { .. })

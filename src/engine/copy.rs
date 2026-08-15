@@ -13,6 +13,7 @@
 //! empty names, and `.`/`..` so a caller cannot accidentally pass a path where
 //! a component is required.
 
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::fmt;
 use std::io;
@@ -28,7 +29,17 @@ use rustix::io::Errno;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-const COPY_BUFFER_SIZE: usize = 128 * 1024;
+// Keep the worker-owned buffered fallback in the documented benchmark range:
+// 256 KiB is large enough for modern local filesystems without making `-j 8`
+// consume an unreasonable amount of resident memory.
+const COPY_BUFFER_SIZE: usize = 256 * 1024;
+
+thread_local! {
+    /// The buffered fallback runs on the calling worker. Keeping its storage
+    /// thread-local bounds memory by the worker count and avoids a fresh
+    /// allocation for every ordinary file copy.
+    static COPY_BUFFER: RefCell<Vec<u8>> = RefCell::new(vec![0; COPY_BUFFER_SIZE]);
+}
 
 /// A normalized timestamp used in the operation's mutation and race checks.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -58,6 +69,34 @@ pub(crate) struct FileStamp {
 }
 
 impl FileStamp {
+    /// Convert the traversal layer's no-follow observation into the stamp
+    /// representation used by the publication boundary.  Keeping this
+    /// conversion here lets planning retain one complete identity record and
+    /// pass it through to the worker without accepting a later pathname stat
+    /// as a new plan.
+    pub(crate) fn from_traverse(stamp: crate::engine::traverse::FileStamp) -> Self {
+        Self {
+            dev: stamp.device,
+            ino: stamp.inode,
+            file_type: match stamp.kind {
+                crate::engine::traverse::EntryKind::Regular => FileType::RegularFile,
+                crate::engine::traverse::EntryKind::Directory => FileType::Directory,
+                crate::engine::traverse::EntryKind::Symlink => FileType::Symlink,
+                crate::engine::traverse::EntryKind::Other => FileType::Unknown,
+            },
+            size: stamp.size as i64,
+            mode: stamp.mode,
+            mtime: Timestamp {
+                seconds: stamp.mtime.seconds,
+                nanoseconds: stamp.mtime.nanoseconds,
+            },
+            ctime: Timestamp {
+                seconds: stamp.ctime.seconds,
+                nanoseconds: stamp.ctime.nanoseconds,
+            },
+        }
+    }
+
     fn from_stat(stat: &Stat) -> Self {
         Self {
             dev: stat.st_dev as u64,
@@ -397,9 +436,10 @@ impl<'a, P: AsFd + ?Sized> TempGuard<'a, P> {
     ) -> Result<(), CopyError> {
         if options.durable
             && let Some(file) = self.file.as_ref()
-                && let Err(error) = crate::platform::sync_file_for_durable_publish(file) {
-                    return self.abort(io_error(error));
-                }
+            && let Err(error) = crate::platform::sync_file_for_durable_publish(file)
+        {
+            return self.abort(io_error(error));
+        }
         if let Err(error) = check_destination(self.parent, destination_name, expected_destination) {
             return self.abort(error);
         }
@@ -475,9 +515,10 @@ fn copy_data<S: AsFd, D: AsFd>(source: S, destination: D) -> Result<CopyOutcome,
         }
     }
 
-    let mut buffer = vec![0u8; COPY_BUFFER_SIZE];
-    let copied =
-        crate::platform::buffered_copy(&source, &destination, &mut buffer).map_err(io_error)?;
+    let copied = COPY_BUFFER.with(|buffer| {
+        crate::platform::buffered_copy(&source, &destination, &mut buffer.borrow_mut())
+            .map_err(io_error)
+    })?;
     Ok(CopyOutcome {
         logical_bytes: copied,
         method: crate::platform::CopyMethod::Buffered,
@@ -549,6 +590,7 @@ pub(crate) fn publish_regular_file<S: AsFd, P: AsFd + ?Sized>(
 /// Same as [`publish_regular_file`], with the invocation's durability
 /// contract.  The separate entry point keeps ordinary callers explicit about
 /// the fact that `fsync` is not part of default atomic publication.
+#[cfg(test)]
 pub(crate) fn publish_regular_file_with_options<S: AsFd, P: AsFd + ?Sized>(
     source: S,
     destination_parent: &P,
@@ -583,9 +625,10 @@ pub(crate) fn publish_regular_file_checked<S: AsFd, P: AsFd + ?Sized>(
         return Err(CopyError::WrongSourceType(source_before.file_type));
     }
     if let Some(expected_source) = expected_source
-        && !expected_source.source_is_stable(source_before) {
-            return Err(CopyError::SourceChanged);
-        }
+        && !expected_source.source_is_stable(source_before)
+    {
+        return Err(CopyError::SourceChanged);
+    }
 
     #[cfg(target_os = "macos")]
     let temporary = {
@@ -653,6 +696,7 @@ pub(crate) fn publish_regular_file_checked<S: AsFd, P: AsFd + ?Sized>(
 /// The source is addressed as `(source_parent, source_name)` because opening a
 /// symlink for ordinary I/O would follow it on the primary Unix targets.  The
 /// raw link target is preserved byte-for-byte, including non-UTF-8 bytes.
+#[cfg(test)]
 pub(crate) fn publish_symlink<SP: AsFd, DP: AsFd + ?Sized>(
     source_parent: SP,
     source_name: &[u8],
@@ -688,9 +732,10 @@ pub(crate) fn publish_symlink_checked<SP: AsFd, DP: AsFd + ?Sized>(
         return Err(CopyError::WrongSourceType(source_before.file_type));
     }
     if let Some(expected_source) = expected_source
-        && !expected_source.source_is_stable(source_before) {
-            return Err(CopyError::SourceChanged);
-        }
+        && !expected_source.source_is_stable(source_before)
+    {
+        return Err(CopyError::SourceChanged);
+    }
     let target = fs::readlinkat(&source_parent, source_name, Vec::<u8>::new()).map_err(io_error)?;
     let temporary = TempGuard::create_symlink(destination_parent, target.as_bytes())?;
 
@@ -764,15 +809,13 @@ mod tests {
             std_fs::read(&destination_path).expect("read destination"),
             b"hello atomic world"
         );
-        assert!(
-            !std_fs::read_dir(&root)
-                .expect("read root")
-                .any(|entry| entry
-                    .expect("entry")
-                    .file_name()
-                    .as_bytes()
-                    .starts_with(b".fs.tmp."))
-        );
+        assert!(!std_fs::read_dir(&root).expect("read root").any(|entry| {
+            entry
+                .expect("entry")
+                .file_name()
+                .as_bytes()
+                .starts_with(b".fs.tmp.")
+        }));
         let _ = std_fs::remove_dir_all(root);
     }
 

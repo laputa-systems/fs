@@ -1,6 +1,12 @@
+TOOLCHAIN := $(shell awk -F'"' '/^channel[[:space:]]*=/ { print $$2; exit }' rust-toolchain.toml)
+CARGO := rustup run $(TOOLCHAIN) cargo
+
 test:
-	cargo test
+	$(CARGO) test --all-targets
+
+format:
+	$(CARGO) fmt --all
 
 lint:
-	cargo fmt --all
-	cargo clippy --fix --allow-dirty --all-targets --all-features -- --deny warnings
+	$(CARGO) fmt --all --check
+	$(CARGO) clippy --all-targets --all-features -- --deny warnings

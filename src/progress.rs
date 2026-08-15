@@ -19,6 +19,7 @@ use rustix::termios::{isatty, tcgetwinsize};
 const DEFAULT_WIDTH: usize = 80;
 const START_DELAY: Duration = Duration::from_millis(150);
 const REFRESH_INTERVAL: Duration = Duration::from_millis(80);
+const RATE_EMA_TIME_CONSTANT: Duration = Duration::from_secs(2);
 
 /// Hot-path counters sampled by a progress renderer.
 #[derive(Debug, Default)]
@@ -195,6 +196,40 @@ impl Progress {
     }
 }
 
+/// A renderer-local exponentially weighted transfer-rate estimator.
+///
+/// Copy workers only update atomics.  Keeping the smoothing state in the
+/// renderer means that reporting never adds coordination to the data path.
+#[derive(Debug, Default)]
+struct RateEstimator {
+    last_sample: Option<(Instant, u64)>,
+    bytes_per_second: f64,
+}
+
+impl RateEstimator {
+    fn sample(&mut self, completed_bytes: u64, now: Instant) -> f64 {
+        let Some((previous_time, previous_bytes)) =
+            self.last_sample.replace((now, completed_bytes))
+        else {
+            return self.bytes_per_second;
+        };
+        let elapsed = now.saturating_duration_since(previous_time);
+        if elapsed.is_zero() {
+            return self.bytes_per_second;
+        }
+
+        let instantaneous =
+            completed_bytes.saturating_sub(previous_bytes) as f64 / elapsed.as_secs_f64();
+        let alpha = 1.0 - (-elapsed.as_secs_f64() / RATE_EMA_TIME_CONSTANT.as_secs_f64()).exp();
+        self.bytes_per_second = if self.bytes_per_second == 0.0 {
+            instantaneous
+        } else {
+            alpha.mul_add(instantaneous - self.bytes_per_second, self.bytes_per_second)
+        };
+        self.bytes_per_second
+    }
+}
+
 /// Whether the process should render interactive progress to stderr.
 ///
 /// `--no-progress` is represented by `disabled`; no force option exists in V1.
@@ -292,13 +327,16 @@ impl ProgressRenderer {
             started.store(true, Ordering::Release);
             let mut stderr = io::stderr();
             let started_at = start;
+            let mut rate_estimator = RateEstimator::default();
             loop {
                 if progress.finished() {
                     break;
                 }
                 let snapshot = progress.snapshot();
                 let width = terminal_width(&stderr);
-                let line = render_line(snapshot, width, started_at.elapsed());
+                let elapsed = started_at.elapsed();
+                let rate = rate_estimator.sample(snapshot.completed_bytes, Instant::now());
+                let line = render_line(snapshot, width, rate, elapsed);
                 let _ = write!(stderr, "\r\x1b[K{line}");
                 let _ = stderr.flush();
                 thread::sleep(interval);
@@ -323,7 +361,13 @@ impl ProgressRenderer {
                 .started_at
                 .map(|start| start.elapsed())
                 .unwrap_or_default();
-            let line = render_line(self.progress.snapshot(), terminal_width(&stderr), elapsed);
+            let snapshot = self.progress.snapshot();
+            let average_rate = if elapsed.is_zero() {
+                0.0
+            } else {
+                snapshot.completed_bytes as f64 / elapsed.as_secs_f64()
+            };
+            let line = render_line(snapshot, terminal_width(&stderr), average_rate, elapsed);
             let _ = write!(stderr, "\r\x1b[K{line}\n");
         } else {
             let _ = write!(stderr, "\r\x1b[K");
@@ -348,11 +392,17 @@ fn terminal_width(stderr: &io::Stderr) -> usize {
         .unwrap_or(DEFAULT_WIDTH)
 }
 
-fn render_line(snapshot: ProgressSnapshot, width: usize, elapsed: Duration) -> String {
+fn render_line(
+    snapshot: ProgressSnapshot,
+    width: usize,
+    bytes_per_second: f64,
+    elapsed: Duration,
+) -> String {
     let width = width.max(1);
+    let spinner = ["|", "/", "-", "\\"][(elapsed.as_millis() / 125 % 4) as usize];
     if snapshot.prune_active {
         let mut line = format!(
-            "pruning  {} scanned  {} deleted",
+            "{spinner} pruning  {} scanned  {} deleted",
             compact_count(snapshot.scanned_entries),
             compact_count(snapshot.deleted_entries)
         );
@@ -360,17 +410,12 @@ fn render_line(snapshot: ProgressSnapshot, width: usize, elapsed: Duration) -> S
         return line;
     }
 
-    let rate = if elapsed.is_zero() {
-        0.0
-    } else {
-        snapshot.completed_bytes as f64 / elapsed.as_secs_f64()
-    };
     if !snapshot.discovery_done {
         let mut line = format!(
-            "|  {} scanned  {} copied  {}  {} changed",
+            "{spinner}  {} scanned  {} copied  {}  {} changed",
             compact_count(snapshot.scanned_entries),
             format_bytes(snapshot.completed_bytes),
-            format_rate(rate),
+            format_rate(bytes_per_second),
             compact_count(snapshot.completed_files)
         );
         truncate_to_width(&mut line, width);
@@ -379,20 +424,30 @@ fn render_line(snapshot: ProgressSnapshot, width: usize, elapsed: Duration) -> S
 
     let total = snapshot.planned_bytes;
     let done = snapshot.completed_bytes.min(total);
-    let percent = if total == 0 {
-        if snapshot.planned_files == 0 { 100 } else { 0 }
+    let percent = done
+        .saturating_mul(100)
+        .checked_div(total)
+        .unwrap_or(if snapshot.planned_files == 0 { 100 } else { 0 })
+        .min(100);
+    let eta = if bytes_per_second > 0.0 && total > done {
+        format!(
+            "  ETA {}",
+            format_duration(Duration::from_secs_f64(
+                (total - done) as f64 / bytes_per_second
+            ))
+        )
     } else {
-        ((done.saturating_mul(100)) / total).min(100)
+        String::new()
     };
     let mut line = if width >= 72 {
-        let bar_width = (width.saturating_sub(53)).clamp(8, 24);
+        let bar_width = (width.saturating_sub(62 + eta.chars().count())).clamp(8, 24);
         format!(
-            "{}/{} {}% {}  {}  {} files",
+            "{}/{} {}% {}  {}  {} files{eta}",
             format_bytes(done),
             format_bytes(total),
             percent,
             progress_bar(percent, bar_width),
-            format_rate(rate),
+            format_rate(bytes_per_second),
             compact_count(snapshot.completed_files)
         )
     } else if width >= 42 {
@@ -401,7 +456,7 @@ fn render_line(snapshot: ProgressSnapshot, width: usize, elapsed: Duration) -> S
             format_bytes(done),
             format_bytes(total),
             percent,
-            format_rate(rate)
+            format_rate(bytes_per_second)
         )
     } else if width >= 20 {
         format!(
@@ -409,13 +464,24 @@ fn render_line(snapshot: ProgressSnapshot, width: usize, elapsed: Duration) -> S
             format_bytes(done),
             format_bytes(total),
             percent,
-            format_rate(rate)
+            format_rate(bytes_per_second)
         )
     } else {
-        format!("{}% {}", percent, format_rate(rate))
+        format!("{}% {}", percent, format_rate(bytes_per_second))
     };
     truncate_to_width(&mut line, width);
     line
+}
+
+fn format_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    if seconds >= 3_600 {
+        format!("{}h{:02}m", seconds / 3_600, seconds / 60 % 60)
+    } else if seconds >= 60 {
+        format!("{}m{:02}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{seconds}s")
+    }
 }
 
 fn progress_bar(percent: u64, width: usize) -> String {
@@ -513,7 +579,7 @@ mod tests {
         };
         for width in [1, 10, 20, 42, 80, 120] {
             assert!(
-                render_line(snapshot, width, Duration::from_secs(1))
+                render_line(snapshot, width, 50.0, Duration::from_secs(1))
                     .chars()
                     .count()
                     <= width.max(1)
@@ -531,6 +597,7 @@ mod tests {
                 ..ProgressSnapshot::default()
             },
             80,
+            100.0,
             Duration::from_secs(1),
         );
         assert!(indeterminate.contains("scanned"));
@@ -542,9 +609,10 @@ mod tests {
                 ..ProgressSnapshot::default()
             },
             80,
+            100.0,
             Duration::from_secs(1),
         );
-        assert!(prune.starts_with("pruning"));
+        assert!(prune.contains("pruning"));
         assert!(prune.contains("3 deleted"));
     }
 
@@ -574,5 +642,17 @@ mod tests {
         assert_eq!(format_bytes(1024), "1.0KiB");
         assert_eq!(format_rate(0.0), "0B/s");
         assert!(format_rate(1024.0).ends_with("/s"));
+        assert_eq!(format_duration(Duration::from_secs(62)), "1m02s");
+    }
+
+    #[test]
+    fn rate_estimator_smooths_progress_without_worker_state() {
+        let start = Instant::now();
+        let mut estimator = RateEstimator::default();
+        assert_eq!(estimator.sample(0, start), 0.0);
+        let rate = estimator.sample(1_000, start + Duration::from_secs(1));
+        assert!(rate > 0.0);
+        let decayed = estimator.sample(1_000, start + Duration::from_secs(2));
+        assert!(decayed < rate);
     }
 }

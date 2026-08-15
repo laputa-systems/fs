@@ -1,52 +1,24 @@
 //! Integration coverage for interruption and atomic publication.
 
 use std::fs;
-use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
-static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+mod support;
 
-struct Fixture {
-    root: std::path::PathBuf,
-}
-
-impl Fixture {
-    fn new() -> Self {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let counter = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::current_dir()
-            .expect("workspace cwd")
-            .join(format!(
-                ".fs-interruption-test-{}-{nonce}-{counter}",
-                std::process::id()
-            ));
-        fs::create_dir(&root).expect("create fixture");
-        Self { root }
-    }
-}
-
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.root);
-    }
-}
+use support::TestDir as Fixture;
 
 #[test]
 fn killing_an_inflight_copy_never_exposes_a_partial_final_file() {
     let fixture = Fixture::new();
-    let source = fixture.root.join("source");
-    let destination = fixture.root.join("destination");
+    let source = fixture.root().join("source");
+    let destination = fixture.root().join("destination");
     let old = vec![b'o'; 8 * 1024 * 1024];
     let new = vec![b'n'; 8 * 1024 * 1024];
     fs::write(&source, &new).expect("write source");
     fs::write(&destination, &old).expect("write destination");
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_fs"))
-        .current_dir(&fixture.root)
+    let mut child = fixture
+        .command()
         .args(["cp", "--no-progress", "source", "destination"])
         .spawn()
         .expect("spawn fs");

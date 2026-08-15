@@ -13,6 +13,141 @@ pub(crate) mod linux;
 #[cfg(target_os = "macos")]
 pub(crate) mod macos;
 
+pub(crate) mod directory;
+
+/// The timestamp grid reported by a platform-specific filesystem query.
+///
+/// Metadata policy owns the interpretation; this platform boundary owns the
+/// raw `fpathconf`/`fstatfs` details and never makes an unknown result look
+/// precise.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TimestampResolutionQuery {
+    Known(u64),
+    Unknown,
+}
+
+/// Query a destination filesystem's timestamp representation from an open
+/// descriptor. Unsupported or indeterminate filesystems return `Unknown`.
+pub(crate) fn timestamp_resolution<Fd: AsFd>(fd: Fd) -> io::Result<TimestampResolutionQuery> {
+    #[cfg(target_os = "linux")]
+    {
+        return linux_timestamp_resolution(fd);
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        macos_timestamp_resolution(fd)
+    }
+
+    #[cfg(target_os = "freebsd")]
+    {
+        let _ = fd;
+        return Ok(TimestampResolutionQuery::Unknown);
+    }
+
+    #[cfg(any(
+        target_os = "aix",
+        target_os = "cygwin",
+        target_os = "dragonfly",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "illumos",
+        target_os = "solaris"
+    ))]
+    {
+        // SAFETY: `fd` is live and the POSIX constant is defined on exactly
+        // these selected targets. A non-positive result is indeterminate.
+        let value = unsafe {
+            libc::fpathconf(
+                std::os::fd::AsRawFd::as_raw_fd(&fd.as_fd()),
+                libc::_PC_TIMESTAMP_RESOLUTION,
+            )
+        };
+        return Ok(if value > 0 {
+            TimestampResolutionQuery::Known(value as u64)
+        } else {
+            TimestampResolutionQuery::Unknown
+        });
+    }
+
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "aix",
+        target_os = "cygwin",
+        target_os = "dragonfly",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "illumos",
+        target_os = "solaris"
+    )))]
+    {
+        let _ = fd;
+        Ok(TimestampResolutionQuery::Unknown)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_timestamp_resolution<Fd: AsFd>(fd: Fd) -> io::Result<TimestampResolutionQuery> {
+    const EXT4_SUPER_MAGIC: u64 = 0x0000_ef53;
+    const BTRFS_SUPER_MAGIC: u64 = 0x9123_683e;
+    const XFS_SUPER_MAGIC: u64 = 0x5846_5342;
+    const F2FS_SUPER_MAGIC: u64 = 0xf2f5_2010;
+    const EROFS_SUPER_MAGIC: u64 = 0xe0f5_e1e2;
+    const TMPFS_MAGIC: u64 = 0x0102_1994;
+    const OVERLAYFS_SUPER_MAGIC: u64 = 0x794c_7630;
+    const MSDOS_SUPER_MAGIC: u64 = 0x0000_4d44;
+    const EXFAT_SUPER_MAGIC: u64 = 0x2011_bab0;
+
+    // SAFETY: `statfs` is initialized by `fstatfs` on success and is never
+    // read on failure.
+    let mut statfs = unsafe { std::mem::zeroed::<libc::statfs>() };
+    // SAFETY: `fd` is live and `statfs` has the exact writable ABI layout.
+    let result =
+        unsafe { libc::fstatfs(std::os::fd::AsRawFd::as_raw_fd(&fd.as_fd()), &mut statfs) };
+    if result != 0 {
+        return Ok(TimestampResolutionQuery::Unknown);
+    }
+    Ok(match statfs.f_type as u64 {
+        EXT4_SUPER_MAGIC
+        | BTRFS_SUPER_MAGIC
+        | XFS_SUPER_MAGIC
+        | F2FS_SUPER_MAGIC
+        | EROFS_SUPER_MAGIC
+        | TMPFS_MAGIC
+        | OVERLAYFS_SUPER_MAGIC => TimestampResolutionQuery::Known(1),
+        MSDOS_SUPER_MAGIC | EXFAT_SUPER_MAGIC => TimestampResolutionQuery::Known(2_000_000_000),
+        _ => TimestampResolutionQuery::Unknown,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn macos_timestamp_resolution<Fd: AsFd>(fd: Fd) -> io::Result<TimestampResolutionQuery> {
+    // SAFETY: `statfs` is initialized by `fstatfs` on success and is never
+    // read on failure.
+    let mut statfs = unsafe { std::mem::zeroed::<libc::statfs>() };
+    // SAFETY: `fd` is live and `statfs` has the exact writable ABI layout.
+    let result =
+        unsafe { libc::fstatfs(std::os::fd::AsRawFd::as_raw_fd(&fd.as_fd()), &mut statfs) };
+    if result != 0 {
+        return Ok(TimestampResolutionQuery::Unknown);
+    }
+    let name_len = statfs
+        .f_fstypename
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(statfs.f_fstypename.len());
+    let name = statfs.f_fstypename[..name_len]
+        .iter()
+        .map(|byte| *byte as u8)
+        .collect::<Vec<_>>();
+    Ok(match name.as_slice() {
+        b"apfs" | b"hfs" => TimestampResolutionQuery::Known(1),
+        _ => TimestampResolutionQuery::Unknown,
+    })
+}
+
 /// Which descriptor-based data path produced a temporary destination.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

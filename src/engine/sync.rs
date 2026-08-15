@@ -149,6 +149,8 @@ struct FileTask {
     source: traverse::OpenedFile,
     destination_parent: traverse::DirectoryFd,
     name: Vec<u8>,
+    expected_source: copy::FileStamp,
+    expected_destination: copy::DestinationExpectation,
     destination_exists: bool,
     options: RunOptions,
     progress: Arc<Progress>,
@@ -180,8 +182,69 @@ fn timestamp_resolution_for<Fd: AsFd>(
     Ok(resolution)
 }
 
+/// Convert the FD-relative traversal observation into the comparison stamp.
+///
+/// This is intentionally a value conversion, not another `fstat`: the normal
+/// metadata no-op path must stay at directory enumeration plus no-follow
+/// `statat` calls. A later open is checked against this observation before it
+/// authorizes a mutation.
+fn metadata_stamp_from_traverse(stamp: traverse::FileStamp) -> metadata::FileStamp {
+    let file_type = match stamp.kind {
+        traverse::EntryKind::Regular => metadata::FileKind::Regular,
+        traverse::EntryKind::Directory => metadata::FileKind::Directory,
+        traverse::EntryKind::Symlink => metadata::FileKind::Symlink,
+        traverse::EntryKind::Other => metadata::FileKind::Other,
+    };
+    metadata::FileStamp {
+        dev: stamp.device,
+        ino: stamp.inode,
+        file_type,
+        size: stamp.size,
+        mode: stamp.mode,
+        mtime: metadata::Timestamp::new(
+            stamp.mtime.seconds,
+            u32::try_from(stamp.mtime.nanoseconds)
+                .expect("filesystem timestamp nanoseconds fit in u32"),
+        ),
+        ctime: metadata::Timestamp::new(
+            stamp.ctime.seconds,
+            u32::try_from(stamp.ctime.nanoseconds)
+                .expect("filesystem timestamp nanoseconds fit in u32"),
+        ),
+    }
+}
+
+/// The default no-op proof deliberately excludes xattrs. V1 propagates them
+/// on real mutations, never by opening/listing an otherwise converged file.
+fn metadata_noop_proven(
+    source: traverse::FileStamp,
+    destination: traverse::FileStamp,
+    resolution: metadata::TimestampResolution,
+) -> bool {
+    let source = metadata_stamp_from_traverse(source);
+    let destination = metadata_stamp_from_traverse(destination);
+    source.size == destination.size
+        && source.permission_bits() == destination.permission_bits()
+        && metadata::compare_timestamps(source.mtime, destination.mtime, resolution)
+            == TimestampComparison::Equal
+}
+
 impl FileTask {
     fn run(self) -> Result<()> {
+        let source_stamp = copy::stamp_fd(&self.source).map_err(|error| {
+            task_conflict(
+                "stat source file before worker",
+                &self.name,
+                error.to_string(),
+            )
+        })?;
+        if !self.expected_source.source_is_stable(source_stamp) {
+            return Err(task_conflict(
+                "copy",
+                &self.name,
+                "source changed after Phase A",
+            ));
+        }
         if self.destination_exists {
             let destination = traverse::open_child_regular_file(
                 &self.destination_parent,
@@ -189,10 +252,29 @@ impl FileTask {
                 self.options.mount_policy,
             )
             .map_err(|error| task_io("open destination file", &self.name, error))?;
-            let source_stamp = metadata::stamp_fd(&self.source)
-                .map_err(|error| task_io("stat source file", &self.name, error))?;
+            let destination_identity = copy::stamp_fd(&destination).map_err(|error| {
+                task_conflict("stat destination file", &self.name, error.to_string())
+            })?;
+            let copy::DestinationExpectation::Present(expected_destination) =
+                self.expected_destination
+            else {
+                return Err(task_conflict(
+                    "compare regular file",
+                    &self.name,
+                    "destination appeared after Phase A",
+                ));
+            };
+            if !expected_destination.destination_is_unchanged(destination_identity) {
+                return Err(task_conflict(
+                    "compare regular file",
+                    &self.name,
+                    "destination changed after Phase A",
+                ));
+            }
             let destination_stamp = metadata::stamp_fd(&destination)
                 .map_err(|error| task_io("stat destination file", &self.name, error))?;
+            let source_stamp = metadata::stamp_fd(&self.source)
+                .map_err(|error| task_io("stat source file", &self.name, error))?;
             let resolution = timestamp_resolution_for(
                 &destination,
                 destination.stamp().mount,
@@ -221,10 +303,12 @@ impl FileTask {
                     &self.progress,
                     &self.source,
                     &destination,
-                    source_stamp,
-                    destination_stamp,
-                    resolution,
-                    &self.name,
+                    RegularMetadata {
+                        source_stamp,
+                        destination_stamp,
+                        resolution,
+                        name: &self.name,
+                    },
                 )?;
                 self.progress.record_skipped_file();
                 return Ok(());
@@ -235,21 +319,24 @@ impl FileTask {
             .map_err(|error| task_io("stat source file before copy", &self.name, error))?
             .size;
         self.progress.record_planned_file(source_size);
-        let expected = copy::stamp_at(&self.destination_parent, &self.name)
-            .map_err(|error| {
-                task_conflict(
-                    "stat destination before copy",
-                    &self.name,
-                    error.to_string(),
-                )
-            })?
-            .map(copy::DestinationExpectation::Present)
-            .unwrap_or(copy::DestinationExpectation::Absent);
-        let publication = copy::publish_regular_file_with_options(
+        if self.options.dry_run {
+            println!(
+                "{}\t{}",
+                if self.destination_exists {
+                    "update"
+                } else {
+                    "copy"
+                },
+                display_component(&self.name)
+            );
+            return Ok(());
+        }
+        let publication = copy::publish_regular_file_checked(
             &self.source,
             &self.destination_parent,
             &self.name,
-            expected,
+            Some(self.expected_source),
+            self.expected_destination,
             copy::PublishOptions {
                 durable: self.options.durable,
                 clone_capabilities: Some(self.clone_capabilities.clone()),
@@ -289,6 +376,17 @@ fn task_conflict(operation: &str, name: &[u8], reason: impl Into<String>) -> FsE
     FsError::conflict(operation, &os_name(name), reason)
 }
 
+/// The metadata observation that authorizes a non-data regular-file update.
+/// Grouping it keeps the mutation boundary explicit: no metadata is applied
+/// from a fresh pathname lookup after comparison has completed.
+#[derive(Clone, Copy)]
+struct RegularMetadata<'a> {
+    source_stamp: metadata::FileStamp,
+    destination_stamp: metadata::FileStamp,
+    resolution: metadata::TimestampResolution,
+    name: &'a [u8],
+}
+
 /// Apply regular-file metadata only when content comparison already proved
 /// equality. This deliberately does not inspect xattrs on a clean no-op.
 fn converge_regular_metadata<S: AsFd, D: AsFd>(
@@ -296,14 +394,15 @@ fn converge_regular_metadata<S: AsFd, D: AsFd>(
     progress: &Progress,
     source: S,
     destination: D,
-    source_stamp: metadata::FileStamp,
-    destination_stamp: metadata::FileStamp,
-    resolution: metadata::TimestampResolution,
-    name: &[u8],
+    metadata: RegularMetadata<'_>,
 ) -> Result<()> {
-    let timestamp =
-        metadata::compare_timestamps(source_stamp.mtime, destination_stamp.mtime, resolution);
-    let mode_changed = source_stamp.permission_bits() != destination_stamp.permission_bits();
+    let timestamp = metadata::compare_timestamps(
+        metadata.source_stamp.mtime,
+        metadata.destination_stamp.mtime,
+        metadata.resolution,
+    );
+    let mode_changed =
+        metadata.source_stamp.permission_bits() != metadata.destination_stamp.permission_bits();
     // An unknown-resolution equal-content file is deliberately not touched
     // just to chase an unrepresentable mtime forever.
     let mtime_changed = timestamp == TimestampComparison::Different;
@@ -311,23 +410,21 @@ fn converge_regular_metadata<S: AsFd, D: AsFd>(
         return Ok(());
     }
     if options.dry_run {
-        if options.verbose {
-            println!("update\t{}", display_component(name));
-        }
+        println!("update\t{}", display_component(metadata.name));
         return Ok(());
     }
     if mode_changed {
-        metadata::set_mode_fd(&destination, source_stamp.mode)
-            .map_err(|error| task_io("set file mode", name, error))?;
+        crate::metadata::set_mode_fd(&destination, metadata.source_stamp.mode)
+            .map_err(|error| task_io("set file mode", metadata.name, error))?;
     }
     if mtime_changed {
-        metadata::set_mtime_fd(&destination, source_stamp.mtime)
-            .map_err(|error| task_io("set file mtime", name, error))?;
+        crate::metadata::set_mtime_fd(&destination, metadata.source_stamp.mtime)
+            .map_err(|error| task_io("set file mtime", metadata.name, error))?;
     }
     metadata::propagate_xattrs(&source, &destination)
-        .map_err(|error| task_io("propagate file xattrs", name, error))?;
+        .map_err(|error| task_io("propagate file xattrs", metadata.name, error))?;
     if options.verbose {
-        println!("update\t{}", display_component(name));
+        println!("update\t{}", display_component(metadata.name));
     }
     progress.record_completed_file(0);
     Ok(())
@@ -500,8 +597,11 @@ impl Engine {
         #[cfg(test)]
         mutate_source_during_phase_a_for_test(source)
             .map_err(|error| self.io("mutate source during Phase A test", b".", error))?;
-        for entry in
-            traverse::enumerate(source).map_err(|error| self.io("enumerate source", b".", error))?
+        let mut entries = traverse::DirectoryEntries::open(source)
+            .map_err(|error| self.io("enumerate source", b".", error))?;
+        while let Some(entry) = entries
+            .next_entry()
+            .map_err(|error| self.io("enumerate source", b".", error))?
         {
             self.progress.record_scanned_entry();
             let source_stamp = traverse::stat_child(source, &entry.name, self.options.mount_policy)
@@ -518,25 +618,29 @@ impl Engine {
             };
 
             if let Some(destination_stamp) = destination_stamp
-                && source_stamp.kind != destination_stamp.kind {
-                    return Err(self.conflict(
-                        "converge",
-                        &entry.name,
-                        "source and destination entry types differ",
-                    ));
-                }
+                && source_stamp.kind != destination_stamp.kind
+            {
+                return Err(self.conflict(
+                    "converge",
+                    &entry.name,
+                    "source and destination entry types differ",
+                ));
+            }
 
             match source_stamp.kind {
                 traverse::EntryKind::Regular => self.converge_regular(
                     source,
                     destination,
                     &entry.name,
-                    destination_stamp.is_some(),
+                    source_stamp,
+                    destination_stamp,
                 )?,
                 traverse::EntryKind::Symlink => self.converge_symlink(
                     source,
                     destination,
                     &entry.name,
+                    source_stamp,
+                    destination_stamp,
                     destination_stamp.is_some(),
                 )?,
                 traverse::EntryKind::Directory => {
@@ -573,31 +677,22 @@ impl Engine {
 
                     self.phase_a_directory(&source_child, destination_child.as_ref())?;
                     if self.options.operation == Operation::Cp
-                        && let Some(destination_child) = destination_child.as_ref() {
-                            if self.workers.is_some() {
-                                self.deferred_directory_finalizers.push(DirectoryFinalizer {
-                                    source: source_child.try_clone().map_err(|error| {
-                                        self.io("duplicate source directory", &entry.name, error)
-                                    })?,
-                                    destination: destination_child.try_clone().map_err(
-                                        |error| {
-                                            self.io(
-                                                "duplicate destination directory",
-                                                &entry.name,
-                                                error,
-                                            )
-                                        },
-                                    )?,
-                                    name: entry.name.clone(),
-                                });
-                            } else {
-                                self.finalize_directory(
-                                    &source_child,
-                                    destination_child,
-                                    &entry.name,
-                                )?;
-                            }
+                        && let Some(destination_child) = destination_child.as_ref()
+                    {
+                        if self.workers.is_some() {
+                            self.deferred_directory_finalizers.push(DirectoryFinalizer {
+                                source: source_child.try_clone().map_err(|error| {
+                                    self.io("duplicate source directory", &entry.name, error)
+                                })?,
+                                destination: destination_child.try_clone().map_err(|error| {
+                                    self.io("duplicate destination directory", &entry.name, error)
+                                })?,
+                                name: entry.name.clone(),
+                            });
+                        } else {
+                            self.finalize_directory(&source_child, destination_child, &entry.name)?;
                         }
+                    }
                 }
                 traverse::EntryKind::Other => {
                     return Err(self.conflict(
@@ -643,20 +738,53 @@ impl Engine {
         source_parent: &traverse::DirectoryFd,
         destination_parent: Option<&traverse::DirectoryFd>,
         name: &[u8],
-        destination_exists: bool,
+        source_stamp: traverse::FileStamp,
+        destination_stamp: Option<traverse::FileStamp>,
     ) -> Result<()> {
         let Some(destination_parent) = destination_parent else {
             self.emit("copy", name);
             return Ok(());
         };
 
-        if self.options.dry_run {
-            self.emit(if destination_exists { "update" } else { "copy" }, name);
-            return Ok(());
+        if let Some(destination_stamp) = destination_stamp
+            && self.options.check == compare::CheckMode::Metadata
+            // A mounted child is permitted only with `--cross-file-systems`.
+            // Its parent FD reports the parent filesystem's timestamp grid,
+            // so defer to the descriptor-opening comparison path instead of
+            // applying a potentially wrong cached resolution.
+            && destination_stamp.mount == destination_parent.stamp().mount
+        {
+            let resolution = timestamp_resolution_for(
+                destination_parent,
+                destination_stamp.mount,
+                &self.timestamp_resolutions,
+            )
+            .map_err(|error| self.io("read destination timestamp resolution", name, error))?;
+            if metadata_noop_proven(source_stamp, destination_stamp, resolution) {
+                self.progress.record_compared_file();
+                self.progress.record_skipped_file();
+                return Ok(());
+            }
         }
         let source =
             traverse::open_child_regular_file(source_parent, name, self.options.mount_policy)
                 .map_err(|error| self.io("open source file", name, error))?;
+        let expected_source = copy::FileStamp::from_traverse(source_stamp);
+        let opened_source = copy::stamp_fd(&source).map_err(|error| {
+            self.conflict("stat source file after open", name, error.to_string())
+        })?;
+        if !expected_source.source_is_stable(opened_source) {
+            return Err(self.conflict(
+                "copy source file",
+                name,
+                "source changed between planning and open",
+            ));
+        }
+        let expected_destination = destination_stamp
+            .map(copy::FileStamp::from_traverse)
+            .map(copy::DestinationExpectation::Present)
+            .unwrap_or(copy::DestinationExpectation::Absent);
+        let destination_exists = destination_stamp.is_some();
         let destination_parent = destination_parent
             .try_clone()
             .map_err(|error| self.io("duplicate destination directory", name, error))?;
@@ -664,6 +792,8 @@ impl Engine {
             source,
             destination_parent,
             name: name.to_vec(),
+            expected_source,
+            expected_destination,
             destination_exists,
             options: self.options,
             progress: self.progress.clone(),
@@ -690,10 +820,12 @@ impl Engine {
             &self.progress,
             source,
             destination,
-            source_stamp,
-            destination_stamp,
-            resolution,
-            name,
+            RegularMetadata {
+                source_stamp,
+                destination_stamp,
+                resolution,
+                name,
+            },
         )
     }
 
@@ -702,6 +834,8 @@ impl Engine {
         source_parent: &traverse::DirectoryFd,
         destination_parent: Option<&traverse::DirectoryFd>,
         name: &[u8],
+        source_stamp: traverse::FileStamp,
+        destination_stamp: Option<traverse::FileStamp>,
         destination_exists: bool,
     ) -> Result<()> {
         let Some(destination_parent) = destination_parent else {
@@ -721,18 +855,20 @@ impl Engine {
             self.emit(if destination_exists { "update" } else { "copy" }, name);
             return Ok(());
         }
-        let expected = copy::stamp_at(destination_parent, name)
-            .map_err(|error| {
-                self.conflict(
-                    "stat destination before symlink copy",
-                    name,
-                    error.to_string(),
-                )
-            })?
+        let expected_source = copy::FileStamp::from_traverse(source_stamp);
+        let expected_destination = destination_stamp
+            .map(copy::FileStamp::from_traverse)
             .map(copy::DestinationExpectation::Present)
             .unwrap_or(copy::DestinationExpectation::Absent);
-        copy::publish_symlink(source_parent, name, destination_parent, name, expected)
-            .map_err(|error| self.conflict("copy symlink", name, error.to_string()))?;
+        copy::publish_symlink_checked(
+            source_parent,
+            name,
+            destination_parent,
+            name,
+            Some(expected_source),
+            expected_destination,
+        )
+        .map_err(|error| self.conflict("copy symlink", name, error.to_string()))?;
         self.emit(if destination_exists { "update" } else { "copy" }, name);
         Ok(())
     }
@@ -790,7 +926,10 @@ impl Engine {
         #[cfg(test)]
         mutate_source_during_prune_for_test(source)
             .map_err(|error| self.io("mutate source during prune test", b".", error))?;
-        for entry in traverse::enumerate(destination)
+        let mut entries = traverse::DirectoryEntries::open(destination)
+            .map_err(|error| self.io("enumerate destination for prune", b".", error))?;
+        while let Some(entry) = entries
+            .next_entry()
             .map_err(|error| self.io("enumerate destination for prune", b".", error))?
         {
             self.progress.record_scanned_entry();
@@ -951,14 +1090,113 @@ pub(crate) fn execute(command: CommandLine) -> Result<()> {
     result
 }
 
+/// Revalidate the root observation made by path establishment and retain the
+/// complete no-follow stamp for the publication boundary.  Root metadata is
+/// intentionally only an identity summary, so this captures the richer stamp
+/// once at the start of root execution and every later publication must still
+/// match it.
+fn root_expectation(
+    engine: &Engine,
+    root: &Root,
+    operation: &str,
+) -> Result<copy::DestinationExpectation> {
+    // Child-operation helpers intentionally reject `.` and `..`, while root
+    // establishment permits them as meaningful final components (`/` becomes
+    // `.`). Re-open those directory roots through the path layer and stamp
+    // the held descriptor instead of weakening the child-name contract.
+    let observed = if matches!(root.leaf(), value if value == OsStr::new(".") || value == OsStr::new(".."))
+    {
+        let directory = root.open_directory(operation)?;
+        Some(copy::stamp_fd(&directory).map_err(|error| {
+            engine.conflict(operation, os_bytes(root.leaf()), error.to_string())
+        })?)
+    } else {
+        copy::stamp_at(root.parent_fd(), os_bytes(root.leaf()))
+            .map_err(|error| engine.conflict(operation, os_bytes(root.leaf()), error.to_string()))?
+    };
+    match (root.metadata(), observed) {
+        (None, None) => Ok(copy::DestinationExpectation::Absent),
+        (Some(initial), Some(current)) if root_identity_matches(initial, current) => {
+            Ok(copy::DestinationExpectation::Present(current))
+        }
+        (None, Some(_)) => Err(engine.conflict(
+            operation,
+            os_bytes(root.leaf()),
+            "root appeared after establishment",
+        )),
+        (Some(_), None) => Err(engine.conflict(
+            operation,
+            os_bytes(root.leaf()),
+            "root disappeared after establishment",
+        )),
+        (Some(_), Some(_)) => Err(engine.conflict(
+            operation,
+            os_bytes(root.leaf()),
+            "root identity changed after establishment",
+        )),
+    }
+}
+
+fn root_identity_matches(initial: path::EntryMetadata, current: copy::FileStamp) -> bool {
+    let kind_matches = match initial.kind {
+        RootEntryKind::RegularFile => current.file_type == rustix::fs::FileType::RegularFile,
+        RootEntryKind::Directory => current.file_type == rustix::fs::FileType::Directory,
+        RootEntryKind::Symlink => current.file_type == rustix::fs::FileType::Symlink,
+        RootEntryKind::Other => false,
+    };
+    initial.dev == current.dev && initial.ino == current.ino && kind_matches
+}
+
 fn execute_directory_root(engine: &mut Engine, source: &Root, destination: &Root) -> Result<()> {
+    let expected_source = match root_expectation(engine, source, "revalidate source root")? {
+        copy::DestinationExpectation::Present(stamp) => stamp,
+        copy::DestinationExpectation::Absent => {
+            return Err(engine.conflict(
+                "revalidate source root",
+                os_bytes(source.leaf()),
+                "source root is absent",
+            ));
+        }
+    };
+    let expected_destination =
+        root_expectation(engine, destination, "revalidate destination root")?;
     let source = traverse::DirectoryFd::from_owned(source.open_directory("open source root")?)
         .map_err(|error| engine.io("open source root", b".", error))?;
+    let opened_source = copy::stamp_fd(&source)
+        .map_err(|error| engine.conflict("stat source root after open", b".", error.to_string()))?;
+    if !expected_source.source_is_stable(opened_source) {
+        return Err(engine.conflict(
+            "open source root",
+            b".",
+            "source root changed between establishment and open",
+        ));
+    }
     let destination = match destination.metadata().map(|metadata| metadata.kind) {
-        Some(RootEntryKind::Directory) => Some(
-            traverse::DirectoryFd::from_owned(destination.open_directory("open destination root")?)
-                .map_err(|error| engine.io("open destination root", b".", error))?,
-        ),
+        Some(RootEntryKind::Directory) => {
+            let directory = traverse::DirectoryFd::from_owned(
+                destination.open_directory("open destination root")?,
+            )
+            .map_err(|error| engine.io("open destination root", b".", error))?;
+            let opened_destination = copy::stamp_fd(&directory).map_err(|error| {
+                engine.conflict("stat destination root after open", b".", error.to_string())
+            })?;
+            let copy::DestinationExpectation::Present(expected_destination) = expected_destination
+            else {
+                return Err(engine.conflict(
+                    "open destination root",
+                    b".",
+                    "destination root disappeared after establishment",
+                ));
+            };
+            if !expected_destination.destination_is_unchanged(opened_destination) {
+                return Err(engine.conflict(
+                    "open destination root",
+                    b".",
+                    "destination root changed between establishment and open",
+                ));
+            }
+            Some(directory)
+        }
         Some(_) => {
             return Err(FsError::conflict(
                 "converge root",
@@ -971,6 +1209,13 @@ fn execute_directory_root(engine: &mut Engine, source: &Root, destination: &Root
             None
         }
         None => {
+            if !matches!(expected_destination, copy::DestinationExpectation::Absent) {
+                return Err(engine.conflict(
+                    "mkdir destination root",
+                    os_bytes(destination.leaf()),
+                    "destination root appeared after establishment",
+                ));
+            }
             fs::mkdirat(
                 destination.parent_fd(),
                 destination.leaf(),
@@ -1004,8 +1249,11 @@ fn execute_directory_root(engine: &mut Engine, source: &Root, destination: &Root
 
     engine.start_file_workers();
     engine.phase_a_directory(&source, destination.as_ref())?;
-    engine.finish_file_workers()?;
+    // Discovery is complete as soon as the walker has scheduled every file.
+    // Workers may still be copying, but the renderer can now use the stable
+    // planned-work denominator instead of remaining indeterminate until join.
     engine.progress.set_discovery_done(true);
+    engine.finish_file_workers()?;
     if let Some(destination) = destination.as_ref() {
         match engine.options.operation {
             Operation::Cp => {
@@ -1036,6 +1284,18 @@ fn execute_directory_root(engine: &mut Engine, source: &Root, destination: &Root
 }
 
 fn execute_regular_root(engine: &mut Engine, source: &Root, destination: &Root) -> Result<()> {
+    let expected_source = match root_expectation(engine, source, "revalidate source root")? {
+        copy::DestinationExpectation::Present(stamp) => stamp,
+        copy::DestinationExpectation::Absent => {
+            return Err(engine.conflict(
+                "revalidate source root",
+                os_bytes(source.leaf()),
+                "source root is absent",
+            ));
+        }
+    };
+    let expected_destination =
+        root_expectation(engine, destination, "revalidate destination root")?;
     match destination.metadata().map(|metadata| metadata.kind) {
         Some(RootEntryKind::RegularFile) | None => {}
         Some(_) => {
@@ -1053,7 +1313,24 @@ fn execute_regular_root(engine: &mut Engine, source: &Root, destination: &Root) 
         Mode::empty(),
     )
     .map_err(|error| engine.io("open source root file", os_bytes(source.leaf()), error))?;
-    let exists = destination.exists;
+    let opened_source = copy::stamp_fd(&source_fd).map_err(|error| {
+        engine.conflict(
+            "stat source root file after open",
+            os_bytes(source.leaf()),
+            error.to_string(),
+        )
+    })?;
+    if !expected_source.source_is_stable(opened_source) {
+        return Err(engine.conflict(
+            "copy root file",
+            os_bytes(source.leaf()),
+            "source changed between establishment and open",
+        ));
+    }
+    let exists = matches!(
+        expected_destination,
+        copy::DestinationExpectation::Present(_)
+    );
     if exists {
         let destination_fd = fs::openat(
             destination.parent_fd(),
@@ -1068,6 +1345,25 @@ fn execute_regular_root(engine: &mut Engine, source: &Root, destination: &Root) 
                 error,
             )
         })?;
+        let opened_destination = copy::stamp_fd(&destination_fd).map_err(|error| {
+            engine.conflict(
+                "stat destination root file after open",
+                os_bytes(destination.leaf()),
+                error.to_string(),
+            )
+        })?;
+        let copy::DestinationExpectation::Present(expected_destination_stamp) =
+            expected_destination
+        else {
+            unreachable!("root destination existence was established above");
+        };
+        if !expected_destination_stamp.destination_is_unchanged(opened_destination) {
+            return Err(engine.conflict(
+                "compare root file",
+                os_bytes(destination.leaf()),
+                "destination changed after establishment",
+            ));
+        }
         let source_stamp = metadata::stamp_fd(&source_fd)
             .map_err(|error| engine.io("stat source root file", os_bytes(source.leaf()), error))?;
         let destination_stamp = metadata::stamp_fd(&destination_fd).map_err(|error| {
@@ -1119,21 +1415,12 @@ fn execute_regular_root(engine: &mut Engine, source: &Root, destination: &Root) 
         );
         return Ok(());
     }
-    let expected = copy::stamp_at(destination.parent_fd(), os_bytes(destination.leaf()))
-        .map_err(|error| {
-            engine.conflict(
-                "stat destination root",
-                os_bytes(destination.leaf()),
-                error.to_string(),
-            )
-        })?
-        .map(copy::DestinationExpectation::Present)
-        .unwrap_or(copy::DestinationExpectation::Absent);
-    copy::publish_regular_file_with_options(
+    copy::publish_regular_file_checked(
         &source_fd,
         destination.parent_fd(),
         os_bytes(destination.leaf()),
-        expected,
+        Some(expected_source),
+        expected_destination,
         engine.publish_options(),
     )
     .map_err(|error| {
@@ -1151,6 +1438,18 @@ fn execute_regular_root(engine: &mut Engine, source: &Root, destination: &Root) 
 }
 
 fn execute_symlink_root(engine: &mut Engine, source: &Root, destination: &Root) -> Result<()> {
+    let expected_source = match root_expectation(engine, source, "revalidate source root")? {
+        copy::DestinationExpectation::Present(stamp) => stamp,
+        copy::DestinationExpectation::Absent => {
+            return Err(engine.conflict(
+                "revalidate source root",
+                os_bytes(source.leaf()),
+                "source root is absent",
+            ));
+        }
+    };
+    let expected_destination =
+        root_expectation(engine, destination, "revalidate destination root")?;
     match destination.metadata().map(|metadata| metadata.kind) {
         Some(RootEntryKind::Symlink) | None => {}
         Some(_) => {
@@ -1161,7 +1460,10 @@ fn execute_symlink_root(engine: &mut Engine, source: &Root, destination: &Root) 
             ));
         }
     }
-    let exists = destination.exists;
+    let exists = matches!(
+        expected_destination,
+        copy::DestinationExpectation::Present(_)
+    );
     if exists {
         let source_target = traverse::read_symlink(source.parent_fd(), os_bytes(source.leaf()))
             .map_err(|error| {
@@ -1188,22 +1490,13 @@ fn execute_symlink_root(engine: &mut Engine, source: &Root, destination: &Root) 
         );
         return Ok(());
     }
-    let expected = copy::stamp_at(destination.parent_fd(), os_bytes(destination.leaf()))
-        .map_err(|error| {
-            engine.conflict(
-                "stat destination root",
-                os_bytes(destination.leaf()),
-                error.to_string(),
-            )
-        })?
-        .map(copy::DestinationExpectation::Present)
-        .unwrap_or(copy::DestinationExpectation::Absent);
-    copy::publish_symlink(
+    copy::publish_symlink_checked(
         source.parent_fd(),
         os_bytes(source.leaf()),
         destination.parent_fd(),
         os_bytes(destination.leaf()),
-        expected,
+        Some(expected_source),
+        expected_destination,
     )
     .map_err(|error| {
         engine.conflict(
@@ -1570,6 +1863,110 @@ mod tests {
         assert_eq!(
             std_fs::read_link(destination_link).unwrap(),
             std::path::Path::new("source-file")
+        );
+        std_fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn planned_destination_stamp_rejects_a_replacement_before_worker_copy() {
+        let root = fixture();
+        let source_path = root.join("source");
+        let destination_path = root.join("destination");
+        std_fs::create_dir(&source_path).unwrap();
+        std_fs::create_dir(&destination_path).unwrap();
+        std_fs::write(source_path.join("file"), b"source bytes").unwrap();
+        std_fs::write(destination_path.join("file"), b"planned destination").unwrap();
+
+        let source_parent =
+            traverse::DirectoryFd::from_owned(std_fs::File::open(&source_path).unwrap().into())
+                .unwrap();
+        let destination_parent = traverse::DirectoryFd::from_owned(
+            std_fs::File::open(&destination_path).unwrap().into(),
+        )
+        .unwrap();
+        let source_stamp =
+            traverse::stat_child(&source_parent, b"file", traverse::MountPolicy::StayOnMount)
+                .unwrap();
+        let destination_stamp = traverse::stat_child(
+            &destination_parent,
+            b"file",
+            traverse::MountPolicy::StayOnMount,
+        )
+        .unwrap();
+        let source = traverse::open_child_regular_file(
+            &source_parent,
+            b"file",
+            traverse::MountPolicy::StayOnMount,
+        )
+        .unwrap();
+
+        // This models a third party replacing the destination after Phase A
+        // but before the queued worker reaches it. The worker must leave the
+        // new object untouched rather than re-stat it as a new expectation.
+        std_fs::write(destination_path.join("file"), b"third-party update").unwrap();
+        let task = FileTask {
+            source,
+            destination_parent: destination_parent.try_clone().unwrap(),
+            name: b"file".to_vec(),
+            expected_source: copy::FileStamp::from_traverse(source_stamp),
+            expected_destination: copy::DestinationExpectation::Present(
+                copy::FileStamp::from_traverse(destination_stamp),
+            ),
+            destination_exists: true,
+            options: RunOptions {
+                operation: Operation::Cp,
+                check: compare::CheckMode::Metadata,
+                mount_policy: traverse::MountPolicy::StayOnMount,
+                dry_run: false,
+                verbose: false,
+                durable: false,
+                jobs: 1,
+            },
+            progress: Arc::new(Progress::new()),
+            timestamp_resolutions: Arc::new(Mutex::new(HashMap::new())),
+            clone_capabilities: Arc::new(copy::CloneCapabilityCache::default()),
+        };
+        let error = task
+            .run()
+            .expect_err("worker must reject a destination changed after Phase A");
+        assert!(
+            error
+                .to_string()
+                .contains("destination changed after Phase A")
+        );
+        assert_eq!(
+            std_fs::read(destination_path.join("file")).unwrap(),
+            b"third-party update"
+        );
+        std_fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn planned_source_stamp_rejects_a_path_replacement_before_open() {
+        let root = fixture();
+        let source_path = root.join("source");
+        std_fs::create_dir(&source_path).unwrap();
+        std_fs::write(source_path.join("file"), b"planned source").unwrap();
+        let source_parent =
+            traverse::DirectoryFd::from_owned(std_fs::File::open(&source_path).unwrap().into())
+                .unwrap();
+        let planned =
+            traverse::stat_child(&source_parent, b"file", traverse::MountPolicy::StayOnMount)
+                .unwrap();
+
+        std_fs::write(source_path.join("replacement"), b"replacement source").unwrap();
+        std_fs::rename(source_path.join("replacement"), source_path.join("file")).unwrap();
+        let opened = traverse::open_child_regular_file(
+            &source_parent,
+            b"file",
+            traverse::MountPolicy::StayOnMount,
+        )
+        .unwrap();
+        let expected = copy::FileStamp::from_traverse(planned);
+        let observed = copy::stamp_fd(&opened).unwrap();
+        assert!(
+            !expected.source_is_stable(observed),
+            "the convergence path must reject this before queuing a worker"
         );
         std_fs::remove_dir_all(root).unwrap();
     }

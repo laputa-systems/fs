@@ -10,7 +10,6 @@ use std::ffi::{CStr, CString};
 use std::io;
 use std::io::ErrorKind;
 use std::ops::Deref;
-use std::os::fd::AsRawFd;
 
 use rustix::fd::{AsFd, BorrowedFd, OwnedFd};
 use rustix::fs::{AtFlags, FileType, Mode, OFlags, Stat, fstat, openat, statat};
@@ -22,8 +21,7 @@ use rustix::fs::{ResolveFlags, StatxFlags, openat2, statx};
 use rustix::io::Errno;
 
 /// Whether traversal may cross a mount boundary.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[derive(Default)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
 pub(crate) enum MountPolicy {
     /// Reject a child on another mount instance.
     #[default]
@@ -33,7 +31,6 @@ pub(crate) enum MountPolicy {
     /// a device number.
     CrossFilesystems,
 }
-
 
 impl MountPolicy {
     fn enforces_boundary(self) -> bool {
@@ -268,15 +265,11 @@ fn mount_matches(parent: MountIdentity, child: MountIdentity) -> Option<bool> {
 }
 
 fn mount_boundary_error() -> io::Error {
-    io::Error::other(
-        "mount boundary encountered; use --cross-file-systems to traverse",
-    )
+    io::Error::other("mount boundary encountered; use --cross-file-systems to traverse")
 }
 
 fn mount_identity_unavailable() -> io::Error {
-    io::Error::other(
-        "cannot determine mount identity safely on this Linux system",
-    )
+    io::Error::other("cannot determine mount identity safely on this Linux system")
 }
 
 fn enforce_observed_mount(
@@ -319,98 +312,75 @@ pub(crate) fn stamp_fd<P: AsFd>(fd: P) -> io::Result<FileStamp> {
     Ok(stamp_from_stat(&stat, mount))
 }
 
-/// Enumerate immediate children from an already-open directory descriptor.
-/// Names are returned as raw bytes and therefore remain valid for non-UTF-8
-/// filenames.  No child is opened or followed by this function.
-pub(crate) fn enumerate<P: AsFd>(dir: P) -> io::Result<Vec<DirectoryEntry>> {
-    // `readdir` is used through a duplicate descriptor so this function does
-    // not consume or close the caller's directory FD.  Names are copied as
-    // bytes immediately and never interpreted as UTF-8.
-    let duplicate = unsafe {
-        // SAFETY: `dir` is a live descriptor for this call. The duplicated
-        // descriptor is either transferred to `fdopendir` or closed below.
-        let raw = libc::dup(dir.as_fd().as_raw_fd());
-        if raw < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if libc::fcntl(raw, libc::F_SETFD, libc::FD_CLOEXEC) < 0 {
-            let error = io::Error::last_os_error();
-            libc::close(raw);
-            return Err(error);
-        }
-        raw
-    };
-    // SAFETY: `duplicate` is an owned directory descriptor. `fdopendir`
-    // assumes ownership only on success; the error branch closes it.
-    let stream = unsafe { libc::fdopendir(duplicate) };
-    if stream.is_null() {
-        let error = io::Error::last_os_error();
-        // SAFETY: `fdopendir` failed and did not consume `duplicate`.
-        unsafe {
-            libc::close(duplicate);
-        }
-        return Err(error);
+/// A bounded stream of immediate children from an already-open directory
+/// descriptor.
+///
+/// The stream owns an independent descriptor for the supplied directory, so
+/// reading it does not change the caller's directory offset or ownership. At most one
+/// [`DirectoryEntry`] (and its name bytes) is live at a time.  Names are
+/// returned as raw bytes and no child is opened or followed by this type.
+#[derive(Debug)]
+pub(crate) struct DirectoryEntries {
+    stream: crate::platform::directory::DirectoryStream,
+}
+
+impl DirectoryEntries {
+    /// Open a stream over the immediate children of `dir`.
+    pub(crate) fn open<P: AsFd>(dir: P) -> io::Result<Self> {
+        crate::platform::directory::DirectoryStream::open(dir).map(|stream| Self { stream })
     }
 
-    let mut entries: Vec<DirectoryEntry> = Vec::new();
-    clear_errno();
-    loop {
-        // SAFETY: `stream` remains valid until the matching `closedir`.
-        let entry = unsafe { libc::readdir(stream) };
-        if entry.is_null() {
-            let error = io::Error::last_os_error();
-            // SAFETY: `stream` is valid and is closed exactly once here.
-            unsafe {
-                libc::closedir(stream);
-            }
-            if error.raw_os_error().is_some_and(|code| code != 0) {
-                return Err(error);
-            }
-            entries.sort_unstable_by(|left, right| left.name.cmp(&right.name));
-            return Ok(entries);
-        }
-        // SAFETY: a non-null `readdir` result points to a valid `dirent`
-        // until the next operation on this directory stream.
-        let entry = unsafe { &*entry };
-        // SAFETY: POSIX guarantees `d_name` is NUL-terminated for this entry.
-        let name = unsafe { CStr::from_ptr(entry.d_name.as_ptr()) }.to_bytes();
-        if name == b"." || name == b".." {
-            continue;
-        }
-        let kind = match entry.d_type {
-            value if value == libc::DT_REG as _ => EntryKind::Regular,
-            value if value == libc::DT_DIR as _ => EntryKind::Directory,
-            value if value == libc::DT_LNK as _ => EntryKind::Symlink,
-            _ => EntryKind::Other,
-        };
-        entries.push(DirectoryEntry {
-            name: name.to_vec(),
-            kind,
-            inode: entry.d_ino as u64,
-        });
+    /// Read the next immediate child.
+    ///
+    /// A `None` result means end-of-directory.  If the directory stream
+    /// reports an error, it is returned and the stream becomes exhausted;
+    /// callers therefore cannot accidentally continue after a partial
+    /// enumeration.
+    pub(crate) fn next_entry(&mut self) -> io::Result<Option<DirectoryEntry>> {
+        self.stream.next_record().map(|entry| {
+            entry.map(|entry| {
+                let kind = match entry.kind {
+                    value if value == libc::DT_REG => EntryKind::Regular,
+                    value if value == libc::DT_DIR => EntryKind::Directory,
+                    value if value == libc::DT_LNK => EntryKind::Symlink,
+                    _ => EntryKind::Other,
+                };
+                DirectoryEntry {
+                    name: entry.name,
+                    kind,
+                    inode: entry.inode,
+                }
+            })
+        })
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
-fn clear_errno() {
-    // `readdir` is permitted to leave errno unchanged at end-of-directory;
-    // clear it before the first call so a prior unrelated syscall cannot be
-    // mistaken for a directory-stream failure.
-    // SAFETY: the selected libc function returns this thread's errno cell.
-    unsafe {
-        #[cfg(target_os = "linux")]
-        {
-            *libc::__errno_location() = 0;
-        }
-        #[cfg(any(target_os = "macos", target_os = "ios"))]
-        {
-            *libc::__error() = 0;
+impl Iterator for DirectoryEntries {
+    type Item = io::Result<DirectoryEntry>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.next_entry() {
+            Ok(Some(entry)) => Some(Ok(entry)),
+            Ok(None) => None,
+            Err(error) => Some(Err(error)),
         }
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios")))]
-fn clear_errno() {}
+/// Visit immediate children from an already-open directory without retaining
+/// the directory's entries in memory.  The callback may stop the traversal by
+/// returning an error; stream errors are propagated unchanged.
+#[cfg(test)]
+pub(crate) fn for_each_entry<P: AsFd, F>(dir: P, mut visit: F) -> io::Result<()>
+where
+    F: FnMut(DirectoryEntry) -> io::Result<()>,
+{
+    let mut entries = DirectoryEntries::open(dir)?;
+    while let Some(entry) = entries.next_entry()? {
+        visit(entry)?;
+    }
+    Ok(())
+}
 
 /// Read a symlink target without following the symlink itself.
 pub(crate) fn read_symlink<P: AsFd>(parent: P, name: &[u8]) -> io::Result<Vec<u8>> {
@@ -566,19 +536,19 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn enumeration_is_byte_safe_and_sorted() {
+    fn enumeration_stream_is_byte_safe_and_bounded() {
         let (path, fd) = test_root();
         let invalid = OsString::from_vec(vec![b'a', 0x80, b'b']);
         fs::File::create(path.join(&invalid)).expect("create invalid name");
         fs::File::create(path.join("plain")).expect("create plain name");
-        let entries = enumerate(&fd).expect("enumerate");
-        assert_eq!(
-            entries
-                .iter()
-                .map(|entry| entry.name.as_slice())
-                .collect::<Vec<_>>(),
-            vec![b"plain".as_slice(), &[b'a', 0x80, b'b']]
-        );
+        let mut entries = Vec::new();
+        for_each_entry(&fd, |entry| {
+            entries.push(entry.name);
+            Ok(())
+        })
+        .expect("enumerate");
+        entries.sort_unstable();
+        assert_eq!(entries, vec![b"plain".to_vec(), vec![b'a', 0x80, b'b']]);
         fs::remove_dir_all(path).expect("remove test root");
     }
 
@@ -597,7 +567,7 @@ mod tests {
     #[test]
     fn invalid_component_cannot_escape_parent() {
         let (path, fd) = test_root();
-        assert!(enumerate(&fd).is_ok());
+        assert!(for_each_entry(&fd, |_| Ok(())).is_ok());
         assert!(stat_child(&fd, b"../outside", MountPolicy::CrossFilesystems).is_err());
         fs::remove_dir_all(path).expect("remove test root");
     }

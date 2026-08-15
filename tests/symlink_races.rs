@@ -1,23 +1,21 @@
 //! Integration coverage for symlink and namespace replacement races.
 
+mod support;
+
 #[cfg(unix)]
 #[test]
 fn root_components_never_follow_symlinks_but_final_source_link_is_an_object() {
     use std::fs;
-    use std::process::Command;
 
-    let root = std::env::current_dir()
-        .expect("workspace cwd")
-        .join(format!(".fs-symlink-test-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&root);
-    fs::create_dir(&root).unwrap();
+    let fixture = support::TestDir::named("symlink-race");
+    let root = fixture.root();
     fs::create_dir(root.join("real")).unwrap();
     fs::create_dir(root.join("real/source")).unwrap();
     fs::write(root.join("real/source/file"), b"payload").unwrap();
     std::os::unix::fs::symlink("real", root.join("alias")).unwrap();
 
-    let rejected = Command::new(env!("CARGO_BIN_EXE_fs"))
-        .current_dir(&root)
+    let rejected = fixture
+        .command()
         .args(["cp", "alias/source", "destination"])
         .output()
         .unwrap();
@@ -25,8 +23,8 @@ fn root_components_never_follow_symlinks_but_final_source_link_is_an_object() {
     assert!(!root.join("destination").exists());
 
     std::os::unix::fs::symlink("real/source/file", root.join("source-link")).unwrap();
-    let copied = Command::new(env!("CARGO_BIN_EXE_fs"))
-        .current_dir(&root)
+    let copied = fixture
+        .command()
         .args(["cp", "source-link", "destination-link"])
         .status()
         .unwrap();
@@ -39,14 +37,13 @@ fn root_components_never_follow_symlinks_but_final_source_link_is_an_object() {
     fs::write(root.join("source-file"), b"source").unwrap();
     fs::write(root.join("outside"), b"outside").unwrap();
     std::os::unix::fs::symlink("outside", root.join("destination-link-conflict")).unwrap();
-    let conflict = Command::new(env!("CARGO_BIN_EXE_fs"))
-        .current_dir(&root)
+    let conflict = fixture
+        .command()
         .args(["cp", "source-file", "destination-link-conflict"])
-        .status()
+        .output()
         .unwrap();
-    assert!(!conflict.success());
+    assert!(!conflict.status.success());
     assert_eq!(fs::read(root.join("outside")).unwrap(), b"outside");
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[cfg(target_os = "linux")]
@@ -68,10 +65,8 @@ mod linux_mounts {
     #[test]
     fn bind_mount_is_a_boundary_even_when_st_dev_matches() {
         let nonce = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::current_dir()
-            .expect("workspace cwd")
-            .join(format!(".fs-bind-mount-{}-{nonce}", std::process::id()));
-        fs::create_dir(&root).unwrap();
+        let fixture = crate::support::TestDir::named(&format!("bind-mount-{nonce}"));
+        let root = fixture.root();
         fs::create_dir(root.join("source")).unwrap();
         fs::create_dir(root.join("source/mounted")).unwrap();
         fs::create_dir(root.join("outside")).unwrap();
@@ -86,20 +81,19 @@ mod linux_mounts {
         if !mount_status.success() {
             // This is commonly unavailable in an unprivileged test runner.
             // The behavior is still covered wherever bind mounts are allowed.
-            fs::remove_dir_all(root).unwrap();
             return;
         }
         let mount_guard = MountGuard(root.join("source/mounted"));
 
-        let rejected = Command::new(env!("CARGO_BIN_EXE_fs"))
-            .current_dir(&root)
+        let rejected = fixture
+            .command()
             .args(["cp", "source", "destination"])
             .status()
             .expect("run fs without cross-filesystems");
         assert!(!rejected.success());
 
-        let allowed = Command::new(env!("CARGO_BIN_EXE_fs"))
-            .current_dir(&root)
+        let allowed = fixture
+            .command()
             .args(["cp", "--cross-file-systems", "source", "destination"])
             .status()
             .expect("run fs with cross-filesystems");
@@ -110,6 +104,5 @@ mod linux_mounts {
         );
 
         drop(mount_guard);
-        fs::remove_dir_all(root).unwrap();
     }
 }
