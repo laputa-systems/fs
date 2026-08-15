@@ -1,0 +1,26 @@
+[package]
+name = "fs"
+version = "0.1.0"
+edition = "2024"
+description = "A small, safe, fast filesystem convergence tool"
+license = "MIT"
+
+[dependencies]
+blake3 = "1"
+libc = "0.2"
+lexopt = "0.3"
+rustix = { version = "1", features = ["fs", "process", "stdio", "termios"] }
+
+[profile.dev]
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
