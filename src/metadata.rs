@@ -6,12 +6,24 @@
 //! The engine works entirely from already-open descriptors; this module does
 //! not reconstruct paths to inspect or mutate metadata.
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::ffi::CStr;
 use std::io;
 use std::os::fd::AsFd;
 
 use rustix::fs::{self, FileType, Mode, Timespec};
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_XATTR_PROPAGATION: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_xattr_propagation_for_test() {
+    FAIL_NEXT_XATTR_PROPAGATION.with(|failure| failure.set(true));
+}
 
 /// A timestamp as returned by `stat`.
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd, Hash)]
@@ -385,6 +397,10 @@ pub(crate) fn propagate_xattrs_with_scratch<S: AsFd, D: AsFd>(
 /// Callers that want explicit ownership of the buffers may instead retain an
 /// [`XattrScratch`] and call [`propagate_xattrs_with_scratch`].
 pub fn propagate_xattrs<S: AsFd, D: AsFd>(source: S, destination: D) -> io::Result<usize> {
+    #[cfg(test)]
+    if FAIL_NEXT_XATTR_PROPAGATION.with(|failure| failure.replace(false)) {
+        return Err(io::Error::other("injected xattr propagation failure"));
+    }
     DEFAULT_XATTR_SCRATCH
         .with_borrow_mut(|scratch| propagate_xattrs_with_scratch(source, destination, scratch))
 }

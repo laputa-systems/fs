@@ -2,10 +2,18 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::ffi::CStr;
 
-use rustix::fd::AsFd;
+use rustix::fd::{AsFd, OwnedFd};
 use rustix::io::{self, Errno};
+
+#[cfg(target_os = "linux")]
+use rustix::fs::{Mode, OFlags};
+
+#[cfg(target_os = "macos")]
+use std::os::fd::{AsRawFd, FromRawFd};
 
 #[cfg(target_os = "linux")]
 pub(crate) mod linux;
@@ -14,6 +22,17 @@ pub(crate) mod linux;
 pub(crate) mod macos;
 
 pub(crate) mod directory;
+pub(crate) mod spool;
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_PARENT_DIRECTORY_SYNC: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_parent_directory_sync_for_test() {
+    FAIL_NEXT_PARENT_DIRECTORY_SYNC.with(|failure| failure.set(true));
+}
 
 /// The timestamp grid reported by a platform-specific filesystem query.
 ///
@@ -85,6 +104,51 @@ pub(crate) fn timestamp_resolution<Fd: AsFd>(fd: Fd) -> io::Result<TimestampReso
     {
         let _ = fd;
         Ok(TimestampResolutionQuery::Unknown)
+    }
+}
+
+/// Open a symlink itself after it has just been created, so an error while
+/// recording its identity can still be recovered through a held descriptor.
+///
+/// Linux exposes this with `O_PATH|O_NOFOLLOW`; Darwin exposes it with
+/// `O_SYMLINK`. Callers must still `fstat` and validate that the descriptor is
+/// a symlink before treating it as an ownership capability.
+pub(crate) fn open_created_symlink<P: AsFd>(parent: P, name: &CStr) -> std::io::Result<OwnedFd> {
+    #[cfg(target_os = "linux")]
+    {
+        rustix::fs::openat(
+            parent,
+            name,
+            OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(std::io::Error::from)
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: `parent` is a live descriptor and `name` is an owned,
+        // NUL-terminated one-component C string. The returned descriptor is
+        // transferred to `OwnedFd` exactly once on success.
+        let raw = unsafe {
+            libc::openat(
+                parent.as_fd().as_raw_fd(),
+                name.as_ptr(),
+                libc::O_SYMLINK | libc::O_CLOEXEC,
+            )
+        };
+        if raw < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            // SAFETY: `raw` is a newly-owned descriptor returned by `openat`.
+            Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (parent, name);
+        Err(std::io::Error::from_raw_os_error(libc::ENOTSUP))
     }
 }
 
@@ -194,6 +258,10 @@ pub(crate) fn sync_file_for_durable_publish<Fd: AsFd>(fd: Fd) -> io::Result<()> 
 
 /// Persist the containing directory after a namespace publication.
 pub(crate) fn sync_parent_directory<Fd: AsFd>(fd: Fd) -> io::Result<()> {
+    #[cfg(test)]
+    if FAIL_NEXT_PARENT_DIRECTORY_SYNC.with(|failure| failure.replace(false)) {
+        return Err(Errno::IO);
+    }
     rustix::fs::fsync(fd)
 }
 

@@ -8,7 +8,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
-use std::io::ErrorKind;
+use std::io::{self, BufReader, BufWriter, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -30,6 +30,314 @@ use crate::workers::{
 
 const HASH_BUFFER_SIZE: usize = 1024 * 1024;
 
+/// One directory child captured during the initial enumeration pass.
+///
+/// The records live in an anonymous temporary file rather than a `Vec`: a
+/// single very wide directory must not make resident memory proportional to
+/// its entry count.  Capturing the complete no-follow observations also lets
+/// descent use the normal planned-child checks after the enumeration stream
+/// is closed, without attempting to resume a new `DIR *` at an old position.
+struct DirectoryWorkRecord {
+    name: Vec<u8>,
+    source: Option<traverse::FileStamp>,
+    destination: Option<traverse::FileStamp>,
+}
+
+struct DirectoryChildSpool {
+    writer: BufWriter<std::fs::File>,
+}
+
+struct DirectoryChildReader {
+    reader: BufReader<std::fs::File>,
+}
+
+/// Per-directory child work starts in memory for the common small-directory
+/// case, then spills to the anonymous spool before it becomes material. A
+/// dry-run must perform no filesystem mutations at all, including creating an
+/// otherwise-unlinked system temporary, so it deliberately remains in memory.
+const DIRECTORY_WORK_MEMORY_LIMIT: usize = 256 * 1024;
+
+enum DirectoryWorkStorage {
+    Memory {
+        records: Vec<DirectoryWorkRecord>,
+        bytes: usize,
+        may_spill: bool,
+    },
+    Spool(DirectoryChildSpool),
+}
+
+enum DirectoryWorkReader {
+    Memory(std::vec::IntoIter<DirectoryWorkRecord>),
+    Spool(DirectoryChildReader),
+}
+
+impl DirectoryWorkStorage {
+    fn new(dry_run: bool) -> Self {
+        Self::Memory {
+            records: Vec::new(),
+            bytes: 0,
+            may_spill: !dry_run,
+        }
+    }
+
+    fn push(&mut self, record: DirectoryWorkRecord) -> io::Result<()> {
+        const RECORD_OVERHEAD: usize = 192;
+        let record_bytes = record.name.len().saturating_add(RECORD_OVERHEAD);
+        if let Self::Memory {
+            records,
+            bytes,
+            may_spill,
+        } = self
+        {
+            if *may_spill && bytes.saturating_add(record_bytes) > DIRECTORY_WORK_MEMORY_LIMIT {
+                let mut spool = DirectoryChildSpool::new()?;
+                for buffered in records.drain(..) {
+                    spool.push(&buffered)?;
+                }
+                spool.push(&record)?;
+                *self = Self::Spool(spool);
+                return Ok(());
+            }
+            *bytes = bytes.saturating_add(record_bytes);
+            records.push(record);
+            return Ok(());
+        }
+        let Self::Spool(spool) = self else {
+            unreachable!("directory work storage is memory or spool")
+        };
+        spool.push(&record)
+    }
+
+    fn into_reader(self) -> io::Result<DirectoryWorkReader> {
+        match self {
+            Self::Memory { records, .. } => Ok(DirectoryWorkReader::Memory(records.into_iter())),
+            Self::Spool(spool) => spool.into_reader().map(DirectoryWorkReader::Spool),
+        }
+    }
+}
+
+impl DirectoryWorkReader {
+    fn next(&mut self) -> io::Result<Option<DirectoryWorkRecord>> {
+        match self {
+            Self::Memory(records) => Ok(records.next()),
+            Self::Spool(reader) => reader.next(),
+        }
+    }
+}
+
+impl DirectoryChildSpool {
+    fn new() -> io::Result<Self> {
+        Ok(Self {
+            writer: BufWriter::new(crate::platform::spool::anonymous_file()?),
+        })
+    }
+
+    fn push(&mut self, record: &DirectoryWorkRecord) -> io::Result<()> {
+        let name_length = u32::try_from(record.name.len()).map_err(|_| {
+            io::Error::new(
+                ErrorKind::InvalidData,
+                "directory entry name exceeds spool record limit",
+            )
+        })?;
+        self.writer.write_all(&name_length.to_le_bytes())?;
+        self.writer.write_all(&record.name)?;
+        match record.source {
+            Some(stamp) => {
+                self.writer.write_all(&[1])?;
+                write_traverse_stamp(&mut self.writer, stamp)?;
+            }
+            None => self.writer.write_all(&[0])?,
+        }
+        match record.destination {
+            Some(stamp) => {
+                self.writer.write_all(&[1])?;
+                write_traverse_stamp(&mut self.writer, stamp)?;
+            }
+            None => self.writer.write_all(&[0])?,
+        }
+        Ok(())
+    }
+
+    fn into_reader(mut self) -> io::Result<DirectoryChildReader> {
+        self.writer.flush()?;
+        let mut file = self
+            .writer
+            .into_inner()
+            .map_err(|error| error.into_error())?;
+        file.seek(SeekFrom::Start(0))?;
+        Ok(DirectoryChildReader {
+            reader: BufReader::new(file),
+        })
+    }
+}
+
+impl DirectoryChildReader {
+    fn next(&mut self) -> io::Result<Option<DirectoryWorkRecord>> {
+        let mut first_length_byte = [0_u8; 1];
+        if self.reader.read(&mut first_length_byte)? == 0 {
+            return Ok(None);
+        }
+        let mut remaining_length = [0_u8; 3];
+        self.reader.read_exact(&mut remaining_length)?;
+        let name_length = u32::from_le_bytes([
+            first_length_byte[0],
+            remaining_length[0],
+            remaining_length[1],
+            remaining_length[2],
+        ]);
+        // Directory APIs never return components this large. The cap turns a
+        // corrupted anonymous spool into a normal error rather than a large
+        // allocation if a platform I/O failure produces malformed bytes.
+        const MAX_COMPONENT_BYTES: usize = 1024 * 1024;
+        let name_length = usize::try_from(name_length).map_err(|_| {
+            io::Error::new(
+                ErrorKind::InvalidData,
+                "invalid directory spool name length",
+            )
+        })?;
+        if name_length > MAX_COMPONENT_BYTES {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "directory spool name length is implausibly large",
+            ));
+        }
+        let mut name = vec![0; name_length];
+        self.reader.read_exact(&mut name)?;
+        let mut source_present = [0_u8; 1];
+        self.reader.read_exact(&mut source_present)?;
+        let source = match source_present[0] {
+            0 => None,
+            1 => Some(read_traverse_stamp(&mut self.reader)?),
+            _ => {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    "invalid source marker in directory spool",
+                ));
+            }
+        };
+        let mut destination_present = [0_u8; 1];
+        self.reader.read_exact(&mut destination_present)?;
+        let destination = match destination_present[0] {
+            0 => None,
+            1 => Some(read_traverse_stamp(&mut self.reader)?),
+            _ => {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    "invalid destination marker in directory spool",
+                ));
+            }
+        };
+        Ok(Some(DirectoryWorkRecord {
+            name,
+            source,
+            destination,
+        }))
+    }
+}
+
+fn write_traverse_stamp<W: Write>(writer: &mut W, stamp: traverse::FileStamp) -> io::Result<()> {
+    writer.write_all(&stamp.device.to_le_bytes())?;
+    writer.write_all(&stamp.inode.to_le_bytes())?;
+    let kind = match stamp.kind {
+        traverse::EntryKind::Regular => 0,
+        traverse::EntryKind::Directory => 1,
+        traverse::EntryKind::Symlink => 2,
+        traverse::EntryKind::Other => 3,
+    };
+    writer.write_all(&[kind])?;
+    writer.write_all(&stamp.mode.to_le_bytes())?;
+    writer.write_all(&stamp.size.to_le_bytes())?;
+    writer.write_all(&stamp.mtime.seconds.to_le_bytes())?;
+    writer.write_all(&stamp.mtime.nanoseconds.to_le_bytes())?;
+    writer.write_all(&stamp.ctime.seconds.to_le_bytes())?;
+    writer.write_all(&stamp.ctime.nanoseconds.to_le_bytes())?;
+    writer.write_all(&stamp.mount.device.to_le_bytes())?;
+    #[cfg(target_os = "linux")]
+    match stamp.mount.mount_id {
+        Some(mount_id) => {
+            writer.write_all(&[1])?;
+            writer.write_all(&mount_id.to_le_bytes())?;
+        }
+        None => writer.write_all(&[0])?,
+    }
+    Ok(())
+}
+
+fn read_traverse_stamp<R: Read>(reader: &mut R) -> io::Result<traverse::FileStamp> {
+    fn read_u64<R: Read>(reader: &mut R) -> io::Result<u64> {
+        let mut bytes = [0; 8];
+        reader.read_exact(&mut bytes)?;
+        Ok(u64::from_le_bytes(bytes))
+    }
+    fn read_i64<R: Read>(reader: &mut R) -> io::Result<i64> {
+        let mut bytes = [0; 8];
+        reader.read_exact(&mut bytes)?;
+        Ok(i64::from_le_bytes(bytes))
+    }
+    fn read_u32<R: Read>(reader: &mut R) -> io::Result<u32> {
+        let mut bytes = [0; 4];
+        reader.read_exact(&mut bytes)?;
+        Ok(u32::from_le_bytes(bytes))
+    }
+
+    let device = read_u64(reader)?;
+    let inode = read_u64(reader)?;
+    let mut kind = [0_u8; 1];
+    reader.read_exact(&mut kind)?;
+    let kind = match kind[0] {
+        0 => traverse::EntryKind::Regular,
+        1 => traverse::EntryKind::Directory,
+        2 => traverse::EntryKind::Symlink,
+        3 => traverse::EntryKind::Other,
+        _ => {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "invalid directory spool kind",
+            ));
+        }
+    };
+    let mode = read_u32(reader)?;
+    let size = read_u64(reader)?;
+    let mtime = traverse::Timestamp {
+        seconds: read_i64(reader)?,
+        nanoseconds: read_i64(reader)?,
+    };
+    let ctime = traverse::Timestamp {
+        seconds: read_i64(reader)?,
+        nanoseconds: read_i64(reader)?,
+    };
+    let mount_device = read_u64(reader)?;
+    #[cfg(target_os = "linux")]
+    let mount_id = {
+        let mut present = [0_u8; 1];
+        reader.read_exact(&mut present)?;
+        match present[0] {
+            0 => None,
+            1 => Some(read_u64(reader)?),
+            _ => {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    "invalid directory spool mount marker",
+                ));
+            }
+        }
+    };
+    Ok(traverse::FileStamp {
+        device,
+        inode,
+        kind,
+        mode,
+        size,
+        mtime,
+        ctime,
+        mount: traverse::MountIdentity {
+            device: mount_device,
+            #[cfg(target_os = "linux")]
+            mount_id,
+        },
+    })
+}
+
 thread_local! {
     /// Each worker owns one reusable BLAKE3 read buffer. This bounds memory
     /// while avoiding a megabyte allocation per compared file.
@@ -40,6 +348,66 @@ thread_local! {
 static PRUNE_MUTATION_TARGET: Mutex<Option<(u64, u64)>> = Mutex::new(None);
 #[cfg(test)]
 static PHASE_A_MUTATION_TARGET: Mutex<Option<(u64, u64)>> = Mutex::new(None);
+#[cfg(test)]
+static FILE_WORKER_FAILURE_TARGET: Mutex<Option<(u64, u64)>> = Mutex::new(None);
+#[cfg(test)]
+static DESTINATION_CHILD_REPLACEMENT_TARGET: Mutex<Option<(u64, u64)>> = Mutex::new(None);
+
+/// Inject one worker-side I/O failure for a chosen source inode. Keeping the
+/// target as an inode avoids cross-test interference while exercising the
+/// actual cancellation and Phase-B gate rather than a synthetic early return
+/// from the directory walker.
+#[cfg(test)]
+fn fail_selected_file_worker_for_test(source: copy::FileStamp) -> Option<FsError> {
+    let should_fail = {
+        let mut target = FILE_WORKER_FAILURE_TARGET
+            .lock()
+            .expect("file worker failure target poisoned");
+        if *target == Some((source.dev, source.ino)) {
+            *target = None;
+            true
+        } else {
+            false
+        }
+    };
+    should_fail.then(|| {
+        FsError::io(
+            "copy test failure",
+            OsStr::new("."),
+            io::Error::other("injected worker I/O failure"),
+        )
+    })
+}
+
+/// Deterministically replace an already-open destination child after its
+/// recursive work returns. This models a same-parent rename/create race which
+/// does not replace the parent itself and therefore requires child-name
+/// revalidation rather than only checking `..`.
+#[cfg(test)]
+fn replace_destination_child_after_phase_a_for_test(
+    child: &traverse::DirectoryFd,
+    name: &[u8],
+) -> std::io::Result<()> {
+    let stamp = child.stamp();
+    let should_replace = {
+        let mut target = DESTINATION_CHILD_REPLACEMENT_TARGET
+            .lock()
+            .expect("destination child replacement target poisoned");
+        if *target == Some((stamp.device, stamp.inode)) {
+            *target = None;
+            true
+        } else {
+            false
+        }
+    };
+    if !should_replace {
+        return Ok(());
+    }
+    let parent = traverse::open_parent_directory(child)?;
+    let parked = b".fs-test-destination-child-parked";
+    fs::renameat(&parent, name, &parent, &parked[..]).map_err(std::io::Error::from)?;
+    fs::mkdirat(&parent, name, Mode::from_raw_mode(0o700)).map_err(std::io::Error::from)
+}
 
 /// Deterministic regression seam for Phase A's directory-membership guard.
 /// The mutation happens through the held directory FD immediately after its
@@ -162,6 +530,11 @@ struct FileTask {
     progress: Arc<Progress>,
     timestamp_resolutions: TimestampResolutionCache,
     clone_capabilities: Arc<copy::CloneCapabilityCache>,
+    /// Every worker checks this immediately before a visible mutation. A
+    /// failure cannot make already-running work transactional, but it bounds
+    /// post-failure publications to work which passed this final boundary
+    /// before cancellation was observed.
+    cancellation: Option<Cancellation>,
     completion: Option<FileCompletionTicket>,
 }
 
@@ -294,6 +667,21 @@ fn metadata_noop_proven(
 }
 
 impl FileTask {
+    fn ensure_not_cancelled(&self) -> Result<()> {
+        if self
+            .cancellation
+            .as_ref()
+            .is_some_and(Cancellation::is_cancelled)
+        {
+            return Err(task_conflict(
+                "copy",
+                &self.display_path,
+                "copy worker was cancelled before publication",
+            ));
+        }
+        Ok(())
+    }
+
     fn run(self) -> Result<()> {
         let source_stamp = copy::stamp_fd(&self.source).map_err(|error| {
             task_conflict(
@@ -302,6 +690,10 @@ impl FileTask {
                 error.to_string(),
             )
         })?;
+        #[cfg(test)]
+        if let Some(error) = fail_selected_file_worker_for_test(source_stamp) {
+            return Err(error);
+        }
         if !self.expected_source.source_is_stable(source_stamp) {
             return Err(task_conflict(
                 "copy",
@@ -427,6 +819,7 @@ impl FileTask {
                         error.to_string(),
                     )
                 })?;
+                self.ensure_not_cancelled()?;
                 converge_regular_metadata(
                     self.options,
                     &self.source,
@@ -462,6 +855,7 @@ impl FileTask {
             self.progress.record_completed_file(source_size);
             return Ok(());
         }
+        self.ensure_not_cancelled()?;
         let publication = copy::publish_regular_file_checked(
             &self.source,
             self.destination_parent.as_ref(),
@@ -591,6 +985,7 @@ impl FileWorkers {
 
     fn enqueue(&self, mut task: FileTask) -> Result<()> {
         task.completion = Some(self.completion.reserve());
+        task.cancellation = Some(self.cancellation.clone());
         match self.sender.send(task) {
             Ok(()) => Ok(()),
             Err(SendError::Closed(_)) => Err(FsError::conflict(
@@ -757,24 +1152,15 @@ impl Engine {
             .map_err(|error| self.io("mutate source during Phase A test", b".", error))?;
         let mut entries = traverse::DirectoryEntries::open(&source)
             .map_err(|error| self.io("enumerate source", b".", error))?;
-        // When a child completes, re-open this verified source directory and
-        // skip through the child name before continuing. POSIX directory
-        // stream offsets are not portable across distinct `DIR *` streams,
-        // so carrying one would make the descriptor bound platform-specific.
-        // The directory stamp below proves the source membership did not
-        // change while its child was processed.
-        let mut resumed_child: Option<Vec<u8>> = None;
+        // POSIX does not permit a closed directory stream to be resumed on a
+        // fresh `DIR *`.  Stream immediate directory-child records to an
+        // anonymous spool instead. Regular files and links still flow to
+        // their normal mutation path as soon as they are discovered.
+        let mut children: Option<DirectoryWorkStorage> = None;
         while let Some(entry) = entries
             .next_entry()
             .map_err(|error| self.io("enumerate source", b".", error))?
         {
-            if let Some(child) = resumed_child.as_ref() {
-                if entry.name == *child {
-                    resumed_child = None;
-                    continue;
-                }
-                continue;
-            }
             if let Some(workers) = self.workers.as_ref() {
                 workers.ensure_not_cancelled()?;
             }
@@ -836,141 +1222,61 @@ impl Engine {
                     destination_stamp,
                 )?,
                 traverse::EntryKind::Directory => {
-                    let source_child = traverse::open_planned_child_directory(
-                        &source,
-                        &entry.name,
-                        source_stamp,
-                        self.options.mount_policy,
-                    )
-                    .map_err(|error| self.io("open source directory", &entry.name, error))?;
-                    let (destination_child, created_destination) = match destination.as_ref() {
-                        Some(parent) if destination_stamp.is_some() => (
-                            Some(Arc::new(
-                                traverse::open_planned_child_directory(
+                    let destination = match (destination.as_ref(), destination_stamp) {
+                        (Some(_), Some(stamp)) => Some(stamp),
+                        (Some(_), None) if self.options.dry_run => {
+                            self.emit_child("mkdir", &relative_path, &entry.name);
+                            None
+                        }
+                        (Some(parent), None) => {
+                            let source_child = traverse::open_planned_child_directory(
+                                &source,
+                                &entry.name,
+                                source_stamp,
+                                self.options.mount_policy,
+                            )
+                            .map_err(|error| {
+                                self.io("open source directory", &entry.name, error)
+                            })?;
+                            let destination_child = self
+                                .create_directory(
                                     parent.as_ref(),
                                     &entry.name,
-                                    destination_stamp.expect("existing destination has a stamp"),
-                                    self.options.mount_policy,
-                                )
-                                .map_err(|error| {
-                                    self.io("open destination directory", &entry.name, error)
-                                })?,
-                            )),
-                            false,
-                        ),
-                        Some(parent) => {
-                            if self.options.dry_run {
-                                self.emit_child("mkdir", &relative_path, &entry.name);
-                                (None, false)
-                            } else {
-                                (
-                                    self.create_directory(
-                                        parent.as_ref(),
+                                    &relative_child_path(&relative_path, &entry.name),
+                                )?
+                                .expect("non-dry-run directory creation returns an FD");
+                            // Directory xattrs are creation metadata. They
+                            // must be copied before this descriptor is closed.
+                            metadata::propagate_xattrs(&source_child, &destination_child).map_err(
+                                |error| {
+                                    self.io(
+                                        "propagate created directory xattrs",
                                         &entry.name,
-                                        &relative_child_path(&relative_path, &entry.name),
-                                    )?
-                                    .map(Arc::new),
-                                    true,
-                                )
-                            }
+                                        error,
+                                    )
+                                },
+                            )?;
+                            Some(destination_child.stamp())
                         }
-                        None => {
+                        (None, _) => {
                             self.emit_child("mkdir", &relative_path, &entry.name);
-                            (None, false)
-                        }
-                    };
-
-                    // Directory xattrs are creation metadata. They must be
-                    // propagated even if the later mode/mtime finalizer finds
-                    // its two fast-path fields already equal.
-                    if created_destination
-                        && let Some(destination_child) = destination_child.as_ref()
-                    {
-                        metadata::propagate_xattrs(&source_child, destination_child.as_ref())
-                            .map_err(|error| {
-                                self.io("propagate created directory xattrs", &entry.name, error)
-                            })?;
-                    }
-
-                    // Re-open and resume this directory through the child
-                    // name after it completes. Drop both parent FDs while
-                    // descending: a wide, deep tree must not consume one
-                    // descriptor per ancestor merely because each ancestor
-                    // has another sibling still to enumerate.
-                    let destination_identity =
-                        destination.as_ref().map(|directory| directory.stamp());
-                    // A dry-run never creates an absent child, so there is no
-                    // descriptor from which to climb back to this destination
-                    // parent. Retain only that dry-run capability; normal
-                    // execution always recovers the parent from its verified
-                    // child descriptor.
-                    let retained_dry_destination =
-                        if destination_child.is_none() && self.options.dry_run {
-                            destination.take()
-                        } else {
                             None
-                        };
-                    drop(entries);
-                    drop(source);
-
-                    let child_relative_path = relative_child_path(&relative_path, &entry.name);
-                    let (source_child, destination_child) = self.phase_a_directory(
-                        source_child,
-                        destination_child,
-                        child_relative_path.clone(),
-                    )?;
-                    self.finalize_phase_a_child(
-                        &source_child,
-                        destination_child.as_deref(),
-                        &child_relative_path,
-                    )?;
-
-                    source = traverse::open_parent_directory(&source_child).map_err(|error| {
-                        self.io("open source parent after child", &entry.name, error)
-                    })?;
-                    let observed_source_parent = traverse::stamp_fd(&source).map_err(|error| {
-                        self.io("stat source parent after child", &entry.name, error)
-                    })?;
-                    if observed_source_parent != source_before {
-                        return Err(self.conflict(
-                            "copy source directory",
-                            &entry.name,
-                            "source directory changed while its child was processed",
-                        ));
-                    }
-                    destination = match (destination_child, destination_identity) {
-                        (Some(destination_child), Some(expected_parent)) => {
-                            let parent =
-                                traverse::open_parent_directory(destination_child.as_ref())
-                                    .map_err(|error| {
-                                        self.io(
-                                            "open destination parent after child",
-                                            &entry.name,
-                                            error,
-                                        )
-                                    })?;
-                            if !parent.stamp().same_object(expected_parent) {
-                                return Err(self.conflict(
-                                    "open destination parent after child",
-                                    &entry.name,
-                                    "destination parent changed while its child was processed",
-                                ));
-                            }
-                            Some(Arc::new(parent))
-                        }
-                        (None, None) => None,
-                        (None, Some(_)) if self.options.dry_run => retained_dry_destination,
-                        _ => {
-                            return Err(self.conflict(
-                                "open destination parent after child",
-                                &entry.name,
-                                "destination child state changed while it was processed",
-                            ));
                         }
                     };
-                    entries = traverse::DirectoryEntries::open(&source)
-                        .map_err(|error| self.io("resume source directory", &entry.name, error))?;
-                    resumed_child = Some(entry.name);
+                    let record = DirectoryWorkRecord {
+                        name: entry.name,
+                        source: Some(source_stamp),
+                        destination,
+                    };
+                    if children.is_none() {
+                        children = Some(DirectoryWorkStorage::new(self.options.dry_run));
+                    }
+                    let record_name = record.name.clone();
+                    children
+                        .as_mut()
+                        .expect("directory work storage is created above")
+                        .push(record)
+                        .map_err(|error| self.io("record directory work", &record_name, error))?;
                 }
                 traverse::EntryKind::Other => {
                     return Err(self.conflict(
@@ -979,6 +1285,165 @@ impl Engine {
                         "unsupported source inode type",
                     ));
                 }
+            }
+        }
+        drop(entries);
+
+        if let Some(children) = children {
+            let mut children = children
+                .into_reader()
+                .map_err(|error| self.io("read directory work", b".", error))?;
+            while let Some(record) = children
+                .next()
+                .map_err(|error| self.io("read directory work", b".", error))?
+            {
+                if let Some(workers) = self.workers.as_ref() {
+                    workers.ensure_not_cancelled()?;
+                }
+                let expected_source = record.source.ok_or_else(|| {
+                    self.conflict(
+                        "read directory work",
+                        &record.name,
+                        "source directory record is missing its source identity",
+                    )
+                })?;
+                let source_child = traverse::open_planned_child_directory(
+                    &source,
+                    &record.name,
+                    expected_source,
+                    self.options.mount_policy,
+                )
+                .map_err(|error| self.io("open source directory", &record.name, error))?;
+                let destination_child = match (destination.as_ref(), record.destination) {
+                    (Some(parent), Some(expected)) => Some(Arc::new(
+                        traverse::open_planned_child_directory(
+                            parent.as_ref(),
+                            &record.name,
+                            expected,
+                            self.options.mount_policy,
+                        )
+                        .map_err(|error| {
+                            self.io("open destination directory", &record.name, error)
+                        })?,
+                    )),
+                    (Some(_), None) if self.options.dry_run => None,
+                    (None, None) => None,
+                    _ => {
+                        return Err(self.conflict(
+                            "open destination directory",
+                            &record.name,
+                            "destination child state changed after discovery",
+                        ));
+                    }
+                };
+                let destination_identity = destination.as_ref().map(|directory| directory.stamp());
+                // An absent dry-run child has no descriptor through which to
+                // recover its destination parent. Retain only that read-only
+                // capability; normal execution recovers both parents from the
+                // returned child descriptors.
+                let retained_dry_destination =
+                    if destination_child.is_none() && self.options.dry_run {
+                        destination.take()
+                    } else {
+                        None
+                    };
+                drop(source);
+                drop(destination);
+
+                let child_relative_path = relative_child_path(&relative_path, &record.name);
+                let (source_child, destination_child) = self.phase_a_directory(
+                    source_child,
+                    destination_child,
+                    child_relative_path.clone(),
+                )?;
+                self.finalize_phase_a_child(
+                    &source_child,
+                    destination_child.as_deref(),
+                    &child_relative_path,
+                )?;
+                #[cfg(test)]
+                if let Some(destination_child) = destination_child.as_deref() {
+                    replace_destination_child_after_phase_a_for_test(
+                        destination_child,
+                        &record.name,
+                    )
+                    .map_err(|error| {
+                        self.io(
+                            "replace destination child during Phase A test",
+                            &record.name,
+                            error,
+                        )
+                    })?;
+                }
+
+                let returned_source = source_child.stamp();
+                source = traverse::open_parent_directory(&source_child).map_err(|error| {
+                    self.io("open source parent after child", &record.name, error)
+                })?;
+                let observed_source_parent = traverse::stamp_fd(&source).map_err(|error| {
+                    self.io("stat source parent after child", &record.name, error)
+                })?;
+                if observed_source_parent != source_before {
+                    return Err(self.conflict(
+                        "copy source directory",
+                        &record.name,
+                        "source directory changed while its child was processed",
+                    ));
+                }
+                let source_child_now =
+                    traverse::stat_child(&source, &record.name, self.options.mount_policy)
+                        .map_err(|error| {
+                            self.io("revalidate source child after copy", &record.name, error)
+                        })?;
+                if !source_child_now.same_object(returned_source) {
+                    return Err(self.conflict(
+                        "revalidate source child after copy",
+                        &record.name,
+                        "source child was replaced while it was processed",
+                    ));
+                }
+                destination = match (destination_child, destination_identity) {
+                    (Some(destination_child), Some(expected_parent)) => {
+                        let returned_destination = destination_child.stamp();
+                        let parent = traverse::open_parent_directory(destination_child.as_ref())
+                            .map_err(|error| {
+                                self.io("open destination parent after child", &record.name, error)
+                            })?;
+                        if !parent.stamp().same_object(expected_parent) {
+                            return Err(self.conflict(
+                                "open destination parent after child",
+                                &record.name,
+                                "destination parent changed while its child was processed",
+                            ));
+                        }
+                        let destination_child_now =
+                            traverse::stat_child(&parent, &record.name, self.options.mount_policy)
+                                .map_err(|error| {
+                                    self.io(
+                                        "revalidate destination child after copy",
+                                        &record.name,
+                                        error,
+                                    )
+                                })?;
+                        if !destination_child_now.same_object(returned_destination) {
+                            return Err(self.conflict(
+                                "revalidate destination child after copy",
+                                &record.name,
+                                "destination child was replaced while it was processed",
+                            ));
+                        }
+                        Some(Arc::new(parent))
+                    }
+                    (None, None) => None,
+                    (None, Some(_)) if self.options.dry_run => retained_dry_destination,
+                    _ => {
+                        return Err(self.conflict(
+                            "open destination parent after child",
+                            &record.name,
+                            "destination child state changed while it was processed",
+                        ));
+                    }
+                };
             }
         }
         let source_after = traverse::stamp_fd(&source)
@@ -1105,6 +1570,7 @@ impl Engine {
             progress: self.progress.clone(),
             timestamp_resolutions: self.timestamp_resolutions.clone(),
             clone_capabilities: self.clone_capabilities.clone(),
+            cancellation: None,
             completion: None,
         };
         // The source walker, rather than the asynchronous comparison worker,
@@ -1253,23 +1719,15 @@ impl Engine {
             .map_err(|error| self.io("mutate source during prune test", b".", error))?;
         let mut entries = traverse::DirectoryEntries::open(&destination)
             .map_err(|error| self.io("enumerate destination for prune", b".", error))?;
-        // See the matching Phase A continuation: directory-stream offsets
-        // cannot be carried across a closed POSIX stream, so resume by
-        // re-enumerating this unchanged destination directory through the
-        // child that was just completed. This releases ancestor descriptors
-        // before descending into a matching subtree.
-        let mut resumed_child: Option<Vec<u8>> = None;
+        // Snapshot every entry before deleting or descending. Readdir is not
+        // specified to retain a useful order after a directory mutation, and
+        // a closed stream cannot be resumed portably. The anonymous spool
+        // gives prune the same bounded-memory continuation as Phase A.
+        let mut work = DirectoryWorkStorage::new(self.options.dry_run);
         while let Some(entry) = entries
             .next_entry()
             .map_err(|error| self.io("enumerate destination for prune", b".", error))?
         {
-            if let Some(child) = resumed_child.as_ref() {
-                if entry.name == *child {
-                    resumed_child = None;
-                    continue;
-                }
-                continue;
-            }
             self.progress.record_scanned_entry();
             let destination_stamp =
                 traverse::stat_child(&destination, &entry.name, self.options.mount_policy)
@@ -1280,91 +1738,135 @@ impl Engine {
                     Err(error) if error.kind() == ErrorKind::NotFound => None,
                     Err(error) => return Err(self.io("stat source for prune", &entry.name, error)),
                 };
-            match source_stamp {
+            if let Some(source_stamp) = source_stamp
+                && source_stamp.kind != destination_stamp.kind
+            {
+                return Err(self.conflict(
+                    "prune",
+                    &entry.name,
+                    "source and destination types changed during sync",
+                ));
+            }
+            let record = DirectoryWorkRecord {
+                name: entry.name,
+                source: source_stamp,
+                destination: Some(destination_stamp),
+            };
+            let record_name = record.name.clone();
+            work.push(record)
+                .map_err(|error| self.io("record prune work", &record_name, error))?;
+        }
+        drop(entries);
+
+        let mut work = work
+            .into_reader()
+            .map_err(|error| self.io("read prune work", b".", error))?;
+        while let Some(record) = work
+            .next()
+            .map_err(|error| self.io("read prune work", b".", error))?
+        {
+            let destination_stamp = record.destination.ok_or_else(|| {
+                self.conflict(
+                    "read prune work",
+                    &record.name,
+                    "destination record is missing its identity",
+                )
+            })?;
+            match record.source {
                 None => self.remove_destination_only(
                     &source,
                     &destination,
-                    &entry.name,
+                    &record.name,
                     destination_stamp,
                 )?,
+                Some(source_stamp) if source_stamp.kind != traverse::EntryKind::Directory => {}
                 Some(source_stamp) => {
-                    if source_stamp.kind != destination_stamp.kind {
+                    let source_child = traverse::open_planned_child_directory(
+                        &source,
+                        &record.name,
+                        source_stamp,
+                        self.options.mount_policy,
+                    )
+                    .map_err(|error| {
+                        self.io("open source directory during prune", &record.name, error)
+                    })?;
+                    let destination_child = traverse::open_planned_child_directory(
+                        &destination,
+                        &record.name,
+                        destination_stamp,
+                        self.options.mount_policy,
+                    )
+                    .map_err(|error| {
+                        self.io(
+                            "open destination directory during prune",
+                            &record.name,
+                            error,
+                        )
+                    })?;
+                    let expected_destination_parent = destination.stamp();
+                    drop(source);
+                    drop(destination);
+                    let (source_child, destination_child) =
+                        self.prune_directory(source_child, destination_child)?;
+
+                    let returned_source = source_child.stamp();
+                    source = traverse::open_parent_directory(&source_child).map_err(|error| {
+                        self.io("open source parent after prune child", &record.name, error)
+                    })?;
+                    let observed_source_parent = traverse::stamp_fd(&source).map_err(|error| {
+                        self.io("stat source parent after prune child", &record.name, error)
+                    })?;
+                    if observed_source_parent != source_before {
                         return Err(self.conflict(
                             "prune",
-                            &entry.name,
-                            "source and destination types changed during sync",
+                            &record.name,
+                            "source directory changed while its child was pruned",
                         ));
                     }
-                    if source_stamp.kind == traverse::EntryKind::Directory {
-                        let source_child = traverse::open_planned_child_directory(
-                            &source,
-                            &entry.name,
-                            source_stamp,
-                            self.options.mount_policy,
-                        )
-                        .map_err(|error| {
-                            self.io("open source directory during prune", &entry.name, error)
-                        })?;
-                        let destination_child = traverse::open_planned_child_directory(
-                            &destination,
-                            &entry.name,
-                            destination_stamp,
-                            self.options.mount_policy,
-                        )
-                        .map_err(|error| {
+                    let source_child_now =
+                        traverse::stat_child(&source, &record.name, self.options.mount_policy)
+                            .map_err(|error| {
+                                self.io("revalidate source child after prune", &record.name, error)
+                            })?;
+                    if !source_child_now.same_object(returned_source) {
+                        return Err(self.conflict(
+                            "revalidate source child after prune",
+                            &record.name,
+                            "source child was replaced while it was pruned",
+                        ));
+                    }
+
+                    let returned_destination = destination_child.stamp();
+                    destination =
+                        traverse::open_parent_directory(&destination_child).map_err(|error| {
                             self.io(
-                                "open destination directory during prune",
-                                &entry.name,
+                                "open destination parent after prune child",
+                                &record.name,
                                 error,
                             )
                         })?;
-                        let expected_destination_parent = destination.stamp();
-                        drop(entries);
-                        drop(source);
-                        drop(destination);
-                        let (source_child, destination_child) =
-                            self.prune_directory(source_child, destination_child)?;
-
-                        source =
-                            traverse::open_parent_directory(&source_child).map_err(|error| {
-                                self.io("open source parent after prune child", &entry.name, error)
-                            })?;
-                        let observed_source_parent =
-                            traverse::stamp_fd(&source).map_err(|error| {
-                                self.io("stat source parent after prune child", &entry.name, error)
-                            })?;
-                        if observed_source_parent != source_before {
-                            return Err(self.conflict(
-                                "prune",
-                                &entry.name,
-                                "source directory changed while its child was pruned",
-                            ));
-                        }
-                        destination = traverse::open_parent_directory(&destination_child).map_err(
-                            |error| {
+                    if !destination.stamp().same_object(expected_destination_parent) {
+                        return Err(self.conflict(
+                            "prune",
+                            &record.name,
+                            "destination directory changed while its child was pruned",
+                        ));
+                    }
+                    let destination_child_now =
+                        traverse::stat_child(&destination, &record.name, self.options.mount_policy)
+                            .map_err(|error| {
                                 self.io(
-                                    "open destination parent after prune child",
-                                    &entry.name,
-                                    error,
-                                )
-                            },
-                        )?;
-                        if !destination.stamp().same_object(expected_destination_parent) {
-                            return Err(self.conflict(
-                                "prune",
-                                &entry.name,
-                                "destination directory changed while its child was pruned",
-                            ));
-                        }
-                        entries =
-                            traverse::DirectoryEntries::open(&destination).map_err(|error| {
-                                self.io(
-                                    "resume destination directory for prune",
-                                    &entry.name,
+                                    "revalidate destination child after prune",
+                                    &record.name,
                                     error,
                                 )
                             })?;
-                        resumed_child = Some(entry.name);
+                    if !destination_child_now.same_object(returned_destination) {
+                        return Err(self.conflict(
+                            "revalidate destination child after prune",
+                            &record.name,
+                            "destination child was replaced while it was pruned",
+                        ));
                     }
                 }
             }
@@ -2264,6 +2766,77 @@ mod tests {
     }
 
     #[test]
+    fn worker_copy_failure_prevents_sync_prune() {
+        let root = fixture();
+        let source = root.join("source");
+        let destination = root.join("destination");
+        std_fs::create_dir(&source).unwrap();
+        std_fs::create_dir(&destination).unwrap();
+        let payload = source.join("payload");
+        std_fs::write(&payload, b"copy failure target").unwrap();
+        std_fs::write(destination.join("stale"), b"must survive failed Phase A").unwrap();
+        let metadata = std_fs::metadata(&payload).unwrap();
+        *FILE_WORKER_FAILURE_TARGET
+            .lock()
+            .expect("file worker failure target") = Some((metadata.dev(), metadata.ino()));
+
+        let error = execute(command(
+            Operation::Sync,
+            source.to_str().unwrap(),
+            destination.to_str().unwrap(),
+        ))
+        .expect_err("a Phase A worker failure must stop before prune");
+        assert!(error.to_string().contains("injected worker I/O failure"));
+        assert!(
+            destination.join("stale").exists(),
+            "sync must not enter destructive Phase B after a copy worker fails"
+        );
+        *FILE_WORKER_FAILURE_TARGET
+            .lock()
+            .expect("file worker failure target") = None;
+        std_fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn destination_child_replacement_after_recursion_is_a_conflict() {
+        let root = fixture();
+        let source = root.join("source");
+        let destination = root.join("destination");
+        std_fs::create_dir(&source).unwrap();
+        std_fs::create_dir(source.join("child")).unwrap();
+        std_fs::write(source.join("child/payload"), b"source payload").unwrap();
+        std_fs::create_dir(&destination).unwrap();
+        std_fs::create_dir(destination.join("child")).unwrap();
+        let metadata = std_fs::metadata(destination.join("child")).unwrap();
+        *DESTINATION_CHILD_REPLACEMENT_TARGET
+            .lock()
+            .expect("destination child replacement target") =
+            Some((metadata.dev(), metadata.ino()));
+
+        let error = execute(command(
+            Operation::Cp,
+            source.to_str().unwrap(),
+            destination.to_str().unwrap(),
+        ))
+        .expect_err("replacing the destination child name must be a conflict");
+        assert!(
+            error
+                .to_string()
+                .contains("destination child was replaced while it was processed")
+        );
+        assert!(destination.join("child").is_dir());
+        assert!(
+            destination
+                .join(".fs-test-destination-child-parked")
+                .is_dir()
+        );
+        *DESTINATION_CHILD_REPLACEMENT_TARGET
+            .lock()
+            .expect("destination child replacement target") = None;
+        std_fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn type_conflict_fails_without_replacing_destination() {
         let root = fixture();
         let source = root.join("source");
@@ -2402,6 +2975,7 @@ mod tests {
             progress: Arc::new(Progress::new()),
             timestamp_resolutions: Arc::new(Mutex::new(HashMap::new())),
             clone_capabilities: Arc::new(copy::CloneCapabilityCache::default()),
+            cancellation: None,
             completion: None,
         };
         let error = task

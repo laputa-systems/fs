@@ -13,6 +13,8 @@
 //! empty names, and `.`/`..` so a caller cannot accidentally pass a path where
 //! a component is required.
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
@@ -20,7 +22,6 @@ use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-#[cfg(target_os = "macos")]
 use std::ffi::CString;
 
 use rustix::fd::AsFd;
@@ -39,6 +40,8 @@ thread_local! {
     /// thread-local bounds memory by the worker count and avoids a fresh
     /// allocation for every ordinary file copy.
     static COPY_BUFFER: RefCell<Vec<u8>> = RefCell::new(vec![0; COPY_BUFFER_SIZE]);
+    #[cfg(test)]
+    static FAIL_NEXT_TEMPORARY_STAMP: Cell<bool> = const { Cell::new(false) };
 }
 
 /// A normalized timestamp used in the operation's mutation and race checks.
@@ -262,6 +265,24 @@ pub(crate) fn stamp_fd<Fd: AsFd>(fd: Fd) -> Result<FileStamp, CopyError> {
         .map_err(io_error)
 }
 
+/// Stamp a newly-created regular temporary. Tests can make this first stamp
+/// fail to exercise the pre-guard recovery path without weakening the normal
+/// descriptor identity check.
+fn stamp_new_temporary<Fd: AsFd>(fd: Fd) -> Result<FileStamp, CopyError> {
+    #[cfg(test)]
+    if FAIL_NEXT_TEMPORARY_STAMP.with(|failure| failure.replace(false)) {
+        return Err(CopyError::Io(io::Error::other(
+            "injected temporary identity-stamp failure",
+        )));
+    }
+    stamp_fd(fd)
+}
+
+#[cfg(test)]
+fn fail_next_temporary_stamp_for_test() {
+    FAIL_NEXT_TEMPORARY_STAMP.with(|failure| failure.set(true));
+}
+
 /// Capture a stamp without following the final path component.
 pub(crate) fn stamp_at<Fd: AsFd>(parent: Fd, name: &[u8]) -> Result<Option<FileStamp>, CopyError> {
     validate_name(name)?;
@@ -304,6 +325,30 @@ fn temp_name(prefix: &[u8]) -> Vec<u8> {
     name
 }
 
+/// Clean up an exclusively-created regular temporary before it has been
+/// adopted by [`TempGuard`]. The first identity stamp may itself fail after
+/// `openat(O_EXCL)` succeeded. Retry through the still-open descriptor, then
+/// unlink only if the parent name still identifies that exact object.
+fn cleanup_unadopted_entry<P: AsFd + ?Sized, Fd: AsFd>(
+    parent: &P,
+    name: &[u8],
+    file: Fd,
+) -> Result<(), CopyError> {
+    let expected = stamp_fd(file)?;
+    match stamp_at(parent, name)? {
+        Some(actual) if expected.same_identity(actual) => {
+            let flags = if expected.file_type == FileType::Directory {
+                AtFlags::REMOVEDIR
+            } else {
+                AtFlags::empty()
+            };
+            fs::unlinkat(parent, name, flags).map_err(io_error)
+        }
+        Some(_) => Err(CopyError::CleanupConflict(name.to_vec())),
+        None => Ok(()),
+    }
+}
+
 /// Identity-checked owner of one unpublished sibling temporary object.
 ///
 /// The guard never recursively follows its name.  Before cleanup it performs
@@ -332,7 +377,13 @@ impl<'a, P: AsFd + ?Sized> TempGuard<'a, P> {
                 Err(Errno::EXIST) => continue,
                 Err(error) => return Err(io_error(error)),
             };
-            let expected = stamp_fd(&file)?;
+            let expected = match stamp_new_temporary(&file) {
+                Ok(expected) => expected,
+                Err(primary) => match cleanup_unadopted_entry(parent, &name, &file) {
+                    Ok(()) => return Err(primary),
+                    Err(cleanup) => return Err(cleanup),
+                },
+            };
             return Ok(Self {
                 parent,
                 name,
@@ -355,11 +406,26 @@ impl<'a, P: AsFd + ?Sized> TempGuard<'a, P> {
             let name = temp_name(b".fs.tmp");
             match fs::symlinkat(target, parent, &name) {
                 Ok(()) => {
-                    let expected = match stamp_at(parent, &name)? {
-                        Some(stamp) => stamp,
-                        None => {
-                            return Err(CopyError::Io(io::Error::from_raw_os_error(libc::ENOENT)));
-                        }
+                    let c_name =
+                        CString::new(name.clone()).expect("generated temporary name has no NUL");
+                    // Hold a descriptor for the new link before recording its
+                    // stamp, so an ordinary first-stamp failure takes the
+                    // same identity-checked cleanup path as regular temps.
+                    let identity = match crate::platform::open_created_symlink(parent, &c_name) {
+                        Ok(identity) => identity,
+                        // Without an object descriptor there is no safe way
+                        // to distinguish our new symlink from a concurrent
+                        // replacement. Retaining the private name is safer
+                        // than unlinking an unverified object.
+                        Err(error) => return Err(CopyError::Io(error)),
+                    };
+                    let expected = match stamp_new_temporary(&identity) {
+                        Ok(expected) if expected.file_type == FileType::Symlink => expected,
+                        Ok(_) => return Err(CopyError::CleanupConflict(name)),
+                        Err(primary) => match cleanup_unadopted_entry(parent, &name, &identity) {
+                            Ok(()) => return Err(primary),
+                            Err(cleanup) => return Err(cleanup),
+                        },
                     };
                     return Ok(Self {
                         parent,
@@ -396,7 +462,13 @@ impl<'a, P: AsFd + ?Sized> TempGuard<'a, P> {
                         Mode::empty(),
                     )
                     .map_err(io_error)?;
-                    let expected = stamp_fd(&file)?;
+                    let expected = match stamp_new_temporary(&file) {
+                        Ok(expected) => expected,
+                        Err(primary) => match cleanup_unadopted_entry(parent, &name, &file) {
+                            Ok(()) => return Err(primary),
+                            Err(cleanup) => return Err(cleanup),
+                        },
+                    };
                     return Ok(Some(Self {
                         parent,
                         name,
@@ -941,6 +1013,128 @@ mod tests {
             std_fs::read(&replacement).expect("replacement survives"),
             b"third-party replacement"
         );
+        let _ = std_fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn temporary_stamp_failure_cleans_the_exclusive_file_before_returning() {
+        let root = unique_dir();
+        let parent = File::open(&root).expect("open parent");
+        fail_next_temporary_stamp_for_test();
+
+        let error = match TempGuard::create_file(&parent) {
+            Ok(_) => panic!("temporary identity stamp failure must be reported"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, CopyError::Io(_)));
+        assert!(
+            !std_fs::read_dir(&root).expect("read root").any(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .as_bytes()
+                    .starts_with(b".fs.tmp.")
+            }),
+            "an exclusive temporary created before its guard must be cleaned"
+        );
+        let _ = std_fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn symlink_temporary_stamp_failure_cleans_the_owned_link_before_returning() {
+        let root = unique_dir();
+        let parent = File::open(&root).expect("open parent");
+        fail_next_temporary_stamp_for_test();
+
+        let error = match TempGuard::create_symlink(&parent, b"link target") {
+            Ok(_) => panic!("temporary identity stamp failure must be reported"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, CopyError::Io(_)));
+        assert!(
+            !std_fs::read_dir(&root).expect("read root").any(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .as_bytes()
+                    .starts_with(b".fs.tmp.")
+            }),
+            "an owned symlink created before its guard must be cleaned"
+        );
+        let _ = std_fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_parent_sync_failure_reports_error_after_atomic_publication() {
+        let root = unique_dir();
+        let source_path = root.join("source");
+        let destination_path = root.join("destination");
+        std_fs::write(&source_path, b"new durable contents").expect("write source");
+        std_fs::write(&destination_path, b"old contents").expect("write destination");
+        let source = File::open(&source_path).expect("open source");
+        let parent = File::open(&root).expect("open parent");
+        let expected = stamp_at(&parent, b"destination")
+            .expect("stamp destination")
+            .map(DestinationExpectation::Present)
+            .unwrap_or(DestinationExpectation::Absent);
+        crate::platform::fail_next_parent_directory_sync_for_test();
+
+        let error = publish_regular_file_with_options(
+            &source,
+            &parent,
+            b"destination",
+            expected,
+            PublishOptions {
+                durable: true,
+                clone_capabilities: None,
+            },
+        )
+        .expect_err("post-rename durability failure must be returned");
+        assert!(matches!(error, CopyError::Io(_)));
+        assert_eq!(
+            std_fs::read(&destination_path).expect("read published destination"),
+            b"new durable contents",
+            "the final name was already atomically published before its parent sync failed"
+        );
+        assert!(!std_fs::read_dir(&root).expect("read root").any(|entry| {
+            entry
+                .expect("entry")
+                .file_name()
+                .as_bytes()
+                .starts_with(b".fs.tmp.")
+        }));
+        let _ = std_fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn metadata_failure_aborts_and_cleans_the_unpublished_temporary() {
+        let root = unique_dir();
+        let source_path = root.join("source");
+        let destination_path = root.join("destination");
+        std_fs::write(&source_path, b"new contents").expect("write source");
+        std_fs::write(&destination_path, b"old contents").expect("write destination");
+        let source = File::open(&source_path).expect("open source");
+        let parent = File::open(&root).expect("open parent");
+        let expected = stamp_at(&parent, b"destination")
+            .expect("stamp destination")
+            .map(DestinationExpectation::Present)
+            .unwrap_or(DestinationExpectation::Absent);
+        crate::metadata::fail_next_xattr_propagation_for_test();
+
+        let error = publish_regular_file(&source, &parent, b"destination", expected)
+            .expect_err("xattr propagation failure must abort publication");
+        assert!(matches!(error, CopyError::Io(_)));
+        assert_eq!(
+            std_fs::read(&destination_path).expect("read original destination"),
+            b"old contents"
+        );
+        assert!(!std_fs::read_dir(&root).expect("read root").any(|entry| {
+            entry
+                .expect("entry")
+                .file_name()
+                .as_bytes()
+                .starts_with(b".fs.tmp.")
+        }));
         let _ = std_fs::remove_dir_all(root);
     }
 

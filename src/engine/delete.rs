@@ -19,6 +19,7 @@ use rustix::fs::{Mode, OFlags};
 use rustix::io::Errno;
 use std::ffi::CStr;
 use std::fmt;
+use std::io::{self, BufReader, BufWriter, ErrorKind, Read, Seek, SeekFrom, Write};
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
 use rustix::fs::RenameFlags;
@@ -26,6 +27,192 @@ use rustix::fs::RenameFlags;
 #[inline]
 fn is_directory(stamp: FileStamp) -> bool {
     stamp.kind == EntryKind::Directory
+}
+
+/// One private-directory entry captured before deletion begins.
+///
+/// Deleting while `readdir` is still live makes subsequent enumeration
+/// unspecified, and a new directory stream cannot safely resume a closed
+/// one. Store only this directory's records in an anonymous spool, then
+/// process them with the same no-follow identity checks used by the public
+/// deletion primitives.
+struct DeleteWorkRecord {
+    name: Vec<u8>,
+    stamp: FileStamp,
+}
+
+struct DeleteWorkSpool {
+    writer: BufWriter<std::fs::File>,
+}
+
+struct DeleteWorkReader {
+    reader: BufReader<std::fs::File>,
+}
+
+impl DeleteWorkSpool {
+    fn new() -> io::Result<Self> {
+        Ok(Self {
+            writer: BufWriter::new(crate::platform::spool::anonymous_file()?),
+        })
+    }
+
+    fn push(&mut self, record: &DeleteWorkRecord) -> io::Result<()> {
+        let name_length = u32::try_from(record.name.len()).map_err(|_| {
+            io::Error::new(
+                ErrorKind::InvalidData,
+                "directory entry name exceeds delete spool record limit",
+            )
+        })?;
+        self.writer.write_all(&name_length.to_le_bytes())?;
+        self.writer.write_all(&record.name)?;
+        write_stamp(&mut self.writer, record.stamp)
+    }
+
+    fn into_reader(mut self) -> io::Result<DeleteWorkReader> {
+        self.writer.flush()?;
+        let mut file = self
+            .writer
+            .into_inner()
+            .map_err(|error| error.into_error())?;
+        file.seek(SeekFrom::Start(0))?;
+        Ok(DeleteWorkReader {
+            reader: BufReader::new(file),
+        })
+    }
+}
+
+impl DeleteWorkReader {
+    fn next(&mut self) -> io::Result<Option<DeleteWorkRecord>> {
+        let mut first_length_byte = [0_u8; 1];
+        if self.reader.read(&mut first_length_byte)? == 0 {
+            return Ok(None);
+        }
+        let mut remaining_length = [0_u8; 3];
+        self.reader.read_exact(&mut remaining_length)?;
+        let name_length = usize::try_from(u32::from_le_bytes([
+            first_length_byte[0],
+            remaining_length[0],
+            remaining_length[1],
+            remaining_length[2],
+        ]))
+        .map_err(|_| io::Error::new(ErrorKind::InvalidData, "invalid delete spool name length"))?;
+        const MAX_COMPONENT_BYTES: usize = 1024 * 1024;
+        if name_length > MAX_COMPONENT_BYTES {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "delete spool name length is implausibly large",
+            ));
+        }
+        let mut name = vec![0; name_length];
+        self.reader.read_exact(&mut name)?;
+        Ok(Some(DeleteWorkRecord {
+            name,
+            stamp: read_stamp(&mut self.reader)?,
+        }))
+    }
+}
+
+fn write_stamp<W: Write>(writer: &mut W, stamp: FileStamp) -> io::Result<()> {
+    writer.write_all(&stamp.device.to_le_bytes())?;
+    writer.write_all(&stamp.inode.to_le_bytes())?;
+    let kind = match stamp.kind {
+        EntryKind::Regular => 0,
+        EntryKind::Directory => 1,
+        EntryKind::Symlink => 2,
+        EntryKind::Other => 3,
+    };
+    writer.write_all(&[kind])?;
+    writer.write_all(&stamp.mode.to_le_bytes())?;
+    writer.write_all(&stamp.size.to_le_bytes())?;
+    writer.write_all(&stamp.mtime.seconds.to_le_bytes())?;
+    writer.write_all(&stamp.mtime.nanoseconds.to_le_bytes())?;
+    writer.write_all(&stamp.ctime.seconds.to_le_bytes())?;
+    writer.write_all(&stamp.ctime.nanoseconds.to_le_bytes())?;
+    writer.write_all(&stamp.mount.device.to_le_bytes())?;
+    #[cfg(target_os = "linux")]
+    match stamp.mount.mount_id {
+        Some(mount_id) => {
+            writer.write_all(&[1])?;
+            writer.write_all(&mount_id.to_le_bytes())?;
+        }
+        None => writer.write_all(&[0])?,
+    }
+    Ok(())
+}
+
+fn read_stamp<R: Read>(reader: &mut R) -> io::Result<FileStamp> {
+    fn read_u64<R: Read>(reader: &mut R) -> io::Result<u64> {
+        let mut bytes = [0; 8];
+        reader.read_exact(&mut bytes)?;
+        Ok(u64::from_le_bytes(bytes))
+    }
+    fn read_i64<R: Read>(reader: &mut R) -> io::Result<i64> {
+        let mut bytes = [0; 8];
+        reader.read_exact(&mut bytes)?;
+        Ok(i64::from_le_bytes(bytes))
+    }
+    fn read_u32<R: Read>(reader: &mut R) -> io::Result<u32> {
+        let mut bytes = [0; 4];
+        reader.read_exact(&mut bytes)?;
+        Ok(u32::from_le_bytes(bytes))
+    }
+
+    let device = read_u64(reader)?;
+    let inode = read_u64(reader)?;
+    let mut kind = [0_u8; 1];
+    reader.read_exact(&mut kind)?;
+    let kind = match kind[0] {
+        0 => EntryKind::Regular,
+        1 => EntryKind::Directory,
+        2 => EntryKind::Symlink,
+        3 => EntryKind::Other,
+        _ => {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "invalid delete spool kind",
+            ));
+        }
+    };
+    let mode = read_u32(reader)?;
+    let size = read_u64(reader)?;
+    let mtime = traverse::Timestamp {
+        seconds: read_i64(reader)?,
+        nanoseconds: read_i64(reader)?,
+    };
+    let ctime = traverse::Timestamp {
+        seconds: read_i64(reader)?,
+        nanoseconds: read_i64(reader)?,
+    };
+    let mount_device = read_u64(reader)?;
+    #[cfg(target_os = "linux")]
+    let mount_id = {
+        let mut present = [0_u8; 1];
+        reader.read_exact(&mut present)?;
+        match present[0] {
+            0 => None,
+            1 => Some(read_u64(reader)?),
+            _ => {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    "invalid delete spool mount marker",
+                ));
+            }
+        }
+    };
+    Ok(FileStamp {
+        device,
+        inode,
+        kind,
+        mode,
+        size,
+        mtime,
+        ctime,
+        mount: traverse::MountIdentity {
+            device: mount_device,
+            #[cfg(target_os = "linux")]
+            mount_id,
+        },
+    })
 }
 
 /// Errors which preserve the distinction between an ordinary I/O failure and
@@ -236,40 +423,40 @@ fn delete_contents(
         return Err(DeleteError::ConcurrentChange);
     }
 
-    // Enumeration borrows only the held directory FD. Directory stream type
-    // bits are advisory; every entry is restatted below. The stream is
-    // bounded: it retains only the current entry rather than materializing an
-    // entire directory in memory.
+    // Capture the immediate entries before the first mutation. A directory
+    // stream has no portable resume token after it is closed, and continuing
+    // to enumerate after unlinking entries leaves readdir's behavior
+    // unspecified. The anonymous spool keeps memory bounded for a very wide
+    // private directory.
     let mut entries = traverse::DirectoryEntries::open(&directory)?;
-    // A private directory has no source-side membership proof, but it still
-    // has to be safe under concurrent replacement. After deleting a child
-    // through its FD, re-open the verified parent and skip through that child
-    // before removing its name. This closes every ancestor while descending
-    // instead of turning stale-tree depth into an FD requirement.
-    let mut completed_child: Option<(Vec<u8>, FileStamp)> = None;
+    let mut work = DeleteWorkSpool::new()?;
     while let Some(entry) = entries.next_entry()? {
-        if let Some((name, child_stamp)) = completed_child.as_ref() {
-            if entry.name != *name {
-                continue;
-            }
-            let name = component(name)?;
-            verify_name_with_policy(&directory, name.as_c_str(), *child_stamp, policy)?;
-            fs::unlinkat(&directory, name.as_c_str(), AtFlags::REMOVEDIR)?;
-            completed_child = None;
-            continue;
-        }
         let observed = match stamp_at_with_policy(&directory, &entry.name, policy) {
             Ok(stamp) => stamp,
             Err(DeleteError::Io(error)) if error == Errno::NOENT => continue,
             Err(error) => return Err(error),
         };
         mount_check(&observed)?;
+        work.push(&DeleteWorkRecord {
+            name: entry.name,
+            stamp: observed,
+        })?;
+    }
+    drop(entries);
 
+    let mut work = work.into_reader()?;
+    while let Some(record) = work.next()? {
+        let observed = match stamp_at_with_policy(&directory, &record.name, policy) {
+            Ok(stamp) if stamp.same_object(record.stamp) => stamp,
+            Ok(_) => return Err(DeleteError::ConcurrentChange),
+            Err(DeleteError::Io(error)) if error == Errno::NOENT => continue,
+            Err(error) => return Err(error),
+        };
+        mount_check(&observed)?;
         if is_directory(observed) {
             let (child, child_stamp) =
-                open_directory_with_policy(&directory, &entry.name, Some(observed), policy)?;
+                open_directory_with_policy(&directory, &record.name, Some(observed), policy)?;
             let expected_parent = directory.stamp();
-            drop(entries);
             drop(directory);
             let child = delete_contents(child, child_stamp, mount_check, policy)?;
             directory = traverse::open_parent_directory(&child)?;
@@ -277,16 +464,18 @@ fn delete_contents(
             if !observed_parent.same_object(expected_parent) {
                 return Err(DeleteError::ConcurrentChange);
             }
-            entries = traverse::DirectoryEntries::open(&directory)?;
-            completed_child = Some((entry.name, observed));
+            let name = component(&record.name)?;
+            let current =
+                verify_name_with_policy(&directory, name.as_c_str(), child.stamp(), policy)?;
+            if !is_directory(current) {
+                return Err(DeleteError::ConcurrentChange);
+            }
+            fs::unlinkat(&directory, name.as_c_str(), AtFlags::REMOVEDIR)?;
         } else {
             // This includes regular files and symlinks. No object is opened
             // for execution or traversal, and no link target is followed.
-            unlink_checked_with_policy(&directory, &entry.name, observed, policy)?;
+            unlink_checked_with_policy(&directory, &record.name, observed, policy)?;
         }
-    }
-    if completed_child.is_some() {
-        return Err(DeleteError::ConcurrentChange);
     }
     Ok(directory)
 }

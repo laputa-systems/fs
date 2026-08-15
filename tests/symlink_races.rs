@@ -182,6 +182,7 @@ fn source_directory_symlink_swaps_never_copy_outside_data() {
 #[cfg(target_os = "linux")]
 mod linux_mounts {
     use std::fs;
+    use std::os::unix::fs::MetadataExt;
     use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -191,12 +192,32 @@ mod linux_mounts {
 
     impl Drop for MountGuard {
         fn drop(&mut self) {
-            let _ = Command::new("umount").arg(&self.0).status();
+            let _ = Command::new("umount").arg(&self.0).output();
+        }
+    }
+
+    /// Mount namespace tests require `CAP_SYS_ADMIN`, which ordinary local
+    /// test processes commonly lack. Keep the opt-out explicit rather than
+    /// silently treating an unavailable mount as coverage. Privileged Linux
+    /// CI must set `FS_TEST_PRIVILEGED_MOUNTS=1`.
+    fn privileged_mount_tests_enabled() -> bool {
+        if std::env::var_os("FS_TEST_PRIVILEGED_MOUNTS").as_deref()
+            == Some(std::ffi::OsStr::new("1"))
+        {
+            true
+        } else {
+            eprintln!(
+                "skipping privileged mount test; set FS_TEST_PRIVILEGED_MOUNTS=1 in Linux CI"
+            );
+            false
         }
     }
 
     #[test]
     fn bind_mount_is_a_boundary_even_when_st_dev_matches() {
+        if !privileged_mount_tests_enabled() {
+            return;
+        }
         let nonce = COUNTER.fetch_add(1, Ordering::Relaxed);
         let fixture = crate::support::TestDir::named(&format!("bind-mount-{nonce}"));
         let root = fixture.root();
@@ -209,13 +230,13 @@ mod linux_mounts {
             .args(["--bind"])
             .arg(root.join("outside"))
             .arg(root.join("source/mounted"))
-            .status()
+            .output()
             .expect("invoke mount");
-        if !mount_status.success() {
-            // This is commonly unavailable in an unprivileged test runner.
-            // The behavior is still covered wherever bind mounts are allowed.
-            return;
-        }
+        assert!(
+            mount_status.status.success(),
+            "privileged mount test was enabled but bind mount failed: {}",
+            String::from_utf8_lossy(&mount_status.stderr)
+        );
         let mount_guard = MountGuard(root.join("source/mounted"));
 
         let rejected = fixture
@@ -234,6 +255,140 @@ mod linux_mounts {
         assert_eq!(
             fs::read(root.join("destination/mounted/file")).unwrap(),
             b"mounted"
+        );
+
+        drop(mount_guard);
+    }
+
+    #[test]
+    fn sync_rejects_a_destination_only_bind_mount_before_pruning() {
+        if !privileged_mount_tests_enabled() {
+            return;
+        }
+        let nonce = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let fixture = crate::support::TestDir::named(&format!("destination-bind-mount-{nonce}"));
+        let root = fixture.root();
+        fs::create_dir(root.join("source")).unwrap();
+        fs::create_dir(root.join("destination")).unwrap();
+        fs::create_dir(root.join("destination/mounted")).unwrap();
+        fs::create_dir(root.join("outside")).unwrap();
+        fs::write(root.join("outside/sentinel"), b"must not be pruned").unwrap();
+
+        let mount_status = Command::new("mount")
+            .args(["--bind"])
+            .arg(root.join("outside"))
+            .arg(root.join("destination/mounted"))
+            .output()
+            .expect("invoke mount");
+        assert!(
+            mount_status.status.success(),
+            "privileged mount test was enabled but bind mount failed: {}",
+            String::from_utf8_lossy(&mount_status.stderr)
+        );
+        let mount_guard = MountGuard(root.join("destination/mounted"));
+
+        let rejected = fixture
+            .command()
+            .args(["sync", "source", "destination"])
+            .status()
+            .expect("run fs without cross-filesystems");
+        assert!(!rejected.success());
+        assert_eq!(
+            fs::read(root.join("outside/sentinel")).unwrap(),
+            b"must not be pruned"
+        );
+
+        drop(mount_guard);
+    }
+
+    #[test]
+    fn copies_between_distinct_source_and_destination_filesystems() {
+        if !privileged_mount_tests_enabled() {
+            return;
+        }
+        let nonce = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let fixture = crate::support::TestDir::named(&format!("tmpfs-copy-{nonce}"));
+        let root = fixture.root();
+        fs::create_dir(root.join("source")).unwrap();
+        let payload = vec![b'x'; 2 * 1024 * 1024];
+        fs::write(root.join("source/payload"), &payload).unwrap();
+        fs::create_dir(root.join("tmpfs")).unwrap();
+
+        let mount_status = Command::new("mount")
+            .args(["-t", "tmpfs", "-o", "size=16m", "tmpfs"])
+            .arg(root.join("tmpfs"))
+            .output()
+            .expect("invoke tmpfs mount");
+        assert!(
+            mount_status.status.success(),
+            "privileged mount test was enabled but tmpfs mount failed: {}",
+            String::from_utf8_lossy(&mount_status.stderr)
+        );
+        let mount_guard = MountGuard(root.join("tmpfs"));
+        assert_ne!(
+            fs::metadata(root.join("source")).unwrap().dev(),
+            fs::metadata(root.join("tmpfs")).unwrap().dev(),
+            "tmpfs fixture must actually be a distinct filesystem"
+        );
+
+        let copied = fixture
+            .command()
+            .args([
+                "cp",
+                "source",
+                root.join("tmpfs/destination").to_str().unwrap(),
+            ])
+            .status()
+            .expect("copy across filesystems");
+        assert!(copied.success());
+        assert_eq!(
+            fs::read(root.join("tmpfs/destination/payload")).unwrap(),
+            payload
+        );
+
+        drop(mount_guard);
+    }
+
+    #[test]
+    fn cross_filesystem_enospc_stops_sync_before_destination_prune() {
+        if !privileged_mount_tests_enabled() {
+            return;
+        }
+        let nonce = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let fixture = crate::support::TestDir::named(&format!("tmpfs-enospc-{nonce}"));
+        let root = fixture.root();
+        fs::create_dir(root.join("source")).unwrap();
+        fs::write(root.join("source/payload"), vec![b'x'; 2 * 1024 * 1024]).unwrap();
+        fs::create_dir(root.join("tmpfs")).unwrap();
+
+        let mount_status = Command::new("mount")
+            .args(["-t", "tmpfs", "-o", "size=1m", "tmpfs"])
+            .arg(root.join("tmpfs"))
+            .output()
+            .expect("invoke tmpfs mount");
+        assert!(
+            mount_status.status.success(),
+            "privileged mount test was enabled but tmpfs mount failed: {}",
+            String::from_utf8_lossy(&mount_status.stderr)
+        );
+        let mount_guard = MountGuard(root.join("tmpfs"));
+        fs::create_dir(root.join("tmpfs/destination")).unwrap();
+        fs::write(root.join("tmpfs/destination/stale"), b"retain on ENOSPC").unwrap();
+
+        let failed = fixture
+            .command()
+            .args([
+                "sync",
+                "--no-progress",
+                "source",
+                root.join("tmpfs/destination").to_str().unwrap(),
+            ])
+            .status()
+            .expect("sync into constrained tmpfs");
+        assert!(!failed.success(), "the tmpfs copy must fail with ENOSPC");
+        assert!(
+            root.join("tmpfs/destination/stale").exists(),
+            "a Phase A data failure must prevent destructive sync prune"
         );
 
         drop(mount_guard);

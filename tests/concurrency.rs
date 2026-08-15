@@ -72,16 +72,18 @@ fn bounded_workers_converge_many_regular_files() {
 }
 
 /// Directory finalization must not retain one source/destination FD pair for
-/// every directory in a wide tree.  A deliberately low child-process FD limit
-/// turns that resource contract into an observable integration test without
-/// constraining the test runner itself.
+/// every directory in a wide tree. This count also exceeds the in-memory
+/// directory-work threshold, exercising the anonymous bounded spool rather
+/// than relying on a reopened directory stream. A deliberately low
+/// child-process FD limit turns the resource contract into an observable
+/// integration test without constraining the test runner itself.
 #[cfg(unix)]
 #[test]
 fn cp_finalizes_wide_directory_trees_with_bounded_file_descriptors() {
     let fixture = Fixture::new();
     let source = fixture.root().join("source");
     fs::create_dir(&source).expect("create source");
-    for index in 0..96 {
+    for index in 0..2048 {
         fs::create_dir(source.join(format!("directory-{index}"))).expect("create source child");
     }
 
@@ -105,7 +107,7 @@ fn cp_finalizes_wide_directory_trees_with_bounded_file_descriptors() {
     }
     let status = command.status().expect("run fs with low fd limit");
     assert!(status.success(), "cp must not retain every directory FD");
-    for index in 0..96 {
+    for index in 0..2048 {
         assert!(
             fixture
                 .path(format!("destination/directory-{index}"))
