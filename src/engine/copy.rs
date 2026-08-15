@@ -14,7 +14,7 @@
 //! a component is required.
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::fmt;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -122,6 +122,7 @@ impl FileStamp {
             && self.ino == other.ino
             && self.file_type == other.file_type
             && self.size == other.size
+            && self.mode == other.mode
             && self.mtime == other.mtime
             && self.ctime == other.ctime
     }
@@ -149,27 +150,50 @@ pub(crate) enum DestinationExpectation {
     Present(FileStamp),
 }
 
-/// Ephemeral record of filesystem pairs which rejected Darwin's structural
-/// clone operation. The engine owns one cache per invocation; nothing is
-/// persisted across command runs.
+/// Ephemeral record of filesystem pairs which rejected a structural
+/// copy-on-write acceleration. The engine owns one cache per invocation;
+/// nothing is persisted across command runs. On macOS this avoids repeated
+/// `fclonefileat` attempts and on Linux it avoids repeated `FICLONE` ioctls.
 #[derive(Debug, Default)]
 pub(crate) struct CloneCapabilityCache {
-    unsupported_pairs: Mutex<HashSet<(u64, u64)>>,
+    pairs: Mutex<HashMap<(u64, u64), CloneCapability>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CloneCapability {
+    Supported,
+    Unsupported,
 }
 
 impl CloneCapabilityCache {
     pub(crate) fn unsupported_for(&self, source_device: u64, destination_device: u64) -> bool {
-        self.unsupported_pairs
-            .lock()
-            .expect("clone capability cache poisoned")
-            .contains(&(source_device, destination_device))
+        matches!(
+            self.pairs
+                .lock()
+                .expect("clone capability cache poisoned")
+                .get(&(source_device, destination_device)),
+            Some(CloneCapability::Unsupported)
+        )
     }
 
     pub(crate) fn record_unsupported(&self, source_device: u64, destination_device: u64) {
-        self.unsupported_pairs
+        self.pairs
             .lock()
             .expect("clone capability cache poisoned")
-            .insert((source_device, destination_device));
+            .insert(
+                (source_device, destination_device),
+                CloneCapability::Unsupported,
+            );
+    }
+
+    pub(crate) fn record_supported(&self, source_device: u64, destination_device: u64) {
+        self.pairs
+            .lock()
+            .expect("clone capability cache poisoned")
+            .insert(
+                (source_device, destination_device),
+                CloneCapability::Supported,
+            );
     }
 }
 
@@ -248,7 +272,10 @@ pub(crate) fn stamp_at<Fd: AsFd>(parent: Fd, name: &[u8]) -> Result<Option<FileS
     }
 }
 
-fn check_destination<Fd: AsFd>(
+/// Revalidate a final destination name against the state captured during
+/// planning. Call this immediately before any visible mutation, including a
+/// metadata-only update that works through an already-open descriptor.
+pub(crate) fn check_destination<Fd: AsFd>(
     parent: Fd,
     name: &[u8],
     expected: DestinationExpectation,
@@ -469,7 +496,13 @@ struct CopyOutcome {
     method: crate::platform::CopyMethod,
 }
 
-fn copy_data<S: AsFd, D: AsFd>(source: S, destination: D) -> Result<CopyOutcome, CopyError> {
+fn copy_data<S: AsFd, D: AsFd>(
+    source: S,
+    destination: D,
+    clone_capabilities: Option<&CloneCapabilityCache>,
+) -> Result<CopyOutcome, CopyError> {
+    #[cfg(not(target_os = "linux"))]
+    let _ = clone_capabilities;
     // A source FD may have been used by a caller before entering this
     // primitive.  Regular files are seekable, and a complete copy must always
     // begin at byte zero.
@@ -477,22 +510,35 @@ fn copy_data<S: AsFd, D: AsFd>(source: S, destination: D) -> Result<CopyOutcome,
 
     #[cfg(target_os = "linux")]
     {
-        match crate::platform::try_reflink(&source, &destination) {
-            Ok(()) => {
-                let size = stamp_fd(&source)?.size;
-                let logical_bytes = u64::try_from(size).map_err(|_| {
-                    CopyError::Io(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "source has a negative size",
-                    ))
-                })?;
-                return Ok(CopyOutcome {
-                    logical_bytes,
-                    method: crate::platform::CopyMethod::Reflink,
-                });
+        let source_device = stamp_fd(&source)?.dev;
+        let destination_device = stamp_fd(&destination)?.dev;
+        let reflink_known_unsupported = clone_capabilities
+            .is_some_and(|cache| cache.unsupported_for(source_device, destination_device));
+        if !reflink_known_unsupported {
+            match crate::platform::try_reflink(&source, &destination) {
+                Ok(()) => {
+                    if let Some(cache) = clone_capabilities {
+                        cache.record_supported(source_device, destination_device);
+                    }
+                    let size = stamp_fd(&source)?.size;
+                    let logical_bytes = u64::try_from(size).map_err(|_| {
+                        CopyError::Io(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "source has a negative size",
+                        ))
+                    })?;
+                    return Ok(CopyOutcome {
+                        logical_bytes,
+                        method: crate::platform::CopyMethod::Reflink,
+                    });
+                }
+                Err(crate::platform::CopyAttemptError::Unsupported) => {
+                    if let Some(cache) = clone_capabilities {
+                        cache.record_unsupported(source_device, destination_device);
+                    }
+                }
+                Err(crate::platform::CopyAttemptError::Io(error)) => return Err(io_error(error)),
             }
-            Err(crate::platform::CopyAttemptError::Unsupported) => {}
-            Err(crate::platform::CopyAttemptError::Io(error)) => return Err(io_error(error)),
         }
 
         // `copy_file_range` is an optional whole-file path.  The platform
@@ -641,7 +687,12 @@ pub(crate) fn publish_regular_file_checked<S: AsFd, P: AsFd + ?Sized>(
             TempGuard::create_file(destination_parent)?
         } else {
             match TempGuard::create_clone(&source, destination_parent)? {
-                Some(temporary) => temporary,
+                Some(temporary) => {
+                    if let Some(cache) = options.clone_capabilities.as_ref() {
+                        cache.record_supported(source_before.dev, destination_device);
+                    }
+                    temporary
+                }
                 None => {
                     if let Some(cache) = options.clone_capabilities.as_ref() {
                         cache.record_unsupported(source_before.dev, destination_device);
@@ -666,7 +717,11 @@ pub(crate) fn publish_regular_file_checked<S: AsFd, P: AsFd + ?Sized>(
             method: crate::platform::CopyMethod::Clone,
         }
     } else {
-        match copy_data(&source, temporary.file()) {
+        match copy_data(
+            &source,
+            temporary.file(),
+            options.clone_capabilities.as_deref(),
+        ) {
             Ok(outcome) => outcome,
             Err(error) => return temporary.abort(error),
         }
@@ -711,6 +766,7 @@ pub(crate) fn publish_symlink<SP: AsFd, DP: AsFd + ?Sized>(
         destination_name,
         None,
         expected_destination,
+        PublishOptions::default(),
     )
 }
 
@@ -723,6 +779,7 @@ pub(crate) fn publish_symlink_checked<SP: AsFd, DP: AsFd + ?Sized>(
     destination_name: &[u8],
     expected_source: Option<FileStamp>,
     expected_destination: DestinationExpectation,
+    options: PublishOptions,
 ) -> Result<Publication, CopyError> {
     validate_name(source_name)?;
     validate_name(destination_name)?;
@@ -753,11 +810,7 @@ pub(crate) fn publish_symlink_checked<SP: AsFd, DP: AsFd + ?Sized>(
         return temporary.abort(CopyError::SourceChanged);
     }
 
-    temporary.publish_replace(
-        destination_name,
-        expected_destination,
-        PublishOptions::default(),
-    )?;
+    temporary.publish_replace(destination_name, expected_destination, options)?;
     Ok(Publication {
         bytes_copied: 0,
         method: crate::platform::CopyMethod::Buffered,
@@ -889,5 +942,16 @@ mod tests {
             b"third-party replacement"
         );
         let _ = std_fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn copy_on_write_capability_cache_is_scoped_by_filesystem_pair() {
+        let cache = CloneCapabilityCache::default();
+        assert!(!cache.unsupported_for(1, 2));
+        cache.record_supported(1, 2);
+        assert!(!cache.unsupported_for(1, 2));
+        cache.record_unsupported(1, 2);
+        assert!(cache.unsupported_for(1, 2));
+        assert!(!cache.unsupported_for(2, 1));
     }
 }

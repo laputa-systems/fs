@@ -226,12 +226,12 @@ pub(crate) fn unlink_checked_with_policy<Fd: AsFd>(
 pub(crate) type MountCheck<'a> = dyn FnMut(&FileStamp) -> DeleteResult<()> + 'a;
 
 fn delete_contents(
-    directory: &DirectoryFd,
+    mut directory: DirectoryFd,
     expected: FileStamp,
     mount_check: &mut MountCheck<'_>,
     policy: MountPolicy,
-) -> DeleteResult<()> {
-    let opened = stamp_fd(directory)?;
+) -> DeleteResult<DirectoryFd> {
+    let opened = stamp_fd(&directory)?;
     if !opened.same_object(expected) || !is_directory(opened) {
         return Err(DeleteError::ConcurrentChange);
     }
@@ -240,9 +240,25 @@ fn delete_contents(
     // bits are advisory; every entry is restatted below. The stream is
     // bounded: it retains only the current entry rather than materializing an
     // entire directory in memory.
-    let mut entries = traverse::DirectoryEntries::open(directory)?;
+    let mut entries = traverse::DirectoryEntries::open(&directory)?;
+    // A private directory has no source-side membership proof, but it still
+    // has to be safe under concurrent replacement. After deleting a child
+    // through its FD, re-open the verified parent and skip through that child
+    // before removing its name. This closes every ancestor while descending
+    // instead of turning stale-tree depth into an FD requirement.
+    let mut completed_child: Option<(Vec<u8>, FileStamp)> = None;
     while let Some(entry) = entries.next_entry()? {
-        let observed = match stamp_at_with_policy(directory, &entry.name, policy) {
+        if let Some((name, child_stamp)) = completed_child.as_ref() {
+            if entry.name != *name {
+                continue;
+            }
+            let name = component(name)?;
+            verify_name_with_policy(&directory, name.as_c_str(), *child_stamp, policy)?;
+            fs::unlinkat(&directory, name.as_c_str(), AtFlags::REMOVEDIR)?;
+            completed_child = None;
+            continue;
+        }
+        let observed = match stamp_at_with_policy(&directory, &entry.name, policy) {
             Ok(stamp) => stamp,
             Err(DeleteError::Io(error)) if error == Errno::NOENT => continue,
             Err(error) => return Err(error),
@@ -251,22 +267,28 @@ fn delete_contents(
 
         if is_directory(observed) {
             let (child, child_stamp) =
-                open_directory_with_policy(directory, &entry.name, Some(observed), policy)?;
-            delete_contents(&child, child_stamp, mount_check, policy)?;
-
-            // The child was emptied through its FD. Revalidate the name
-            // before the final rmdir; a replacement is left untouched.
-            let name = component(&entry.name)?;
-            verify_name_with_policy(directory, name.as_c_str(), observed, policy)?;
-            fs::unlinkat(directory, name.as_c_str(), AtFlags::REMOVEDIR)?;
+                open_directory_with_policy(&directory, &entry.name, Some(observed), policy)?;
+            let expected_parent = directory.stamp();
+            drop(entries);
+            drop(directory);
+            let child = delete_contents(child, child_stamp, mount_check, policy)?;
+            directory = traverse::open_parent_directory(&child)?;
+            let observed_parent = stamp_fd(&directory)?;
+            if !observed_parent.same_object(expected_parent) {
+                return Err(DeleteError::ConcurrentChange);
+            }
+            entries = traverse::DirectoryEntries::open(&directory)?;
+            completed_child = Some((entry.name, observed));
         } else {
             // This includes regular files and symlinks. No object is opened
             // for execution or traversal, and no link target is followed.
-            unlink_checked_with_policy(directory, &entry.name, observed, policy)?;
+            unlink_checked_with_policy(&directory, &entry.name, observed, policy)?;
         }
     }
-
-    Ok(())
+    if completed_child.is_some() {
+        return Err(DeleteError::ConcurrentChange);
+    }
+    Ok(directory)
 }
 
 /// Recursively delete an already-open directory's contents.
@@ -287,6 +309,7 @@ pub(crate) fn remove_directory_contents(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn remove_directory_contents_with_policy(
     directory: &DirectoryFd,
     expected: FileStamp,
@@ -296,7 +319,9 @@ pub(crate) fn remove_directory_contents_with_policy(
     if !is_directory(expected) {
         return Err(DeleteError::ConcurrentChange);
     }
-    delete_contents(directory, expected, mount_check, policy)
+    let directory = traverse::reopen_directory(directory)?;
+    let _ = delete_contents(directory, expected, mount_check, policy)?;
+    Ok(())
 }
 
 /// The private name used when destination-only directories are taken out of
@@ -413,7 +438,7 @@ pub(crate) fn prune_directory_with_policy<Fd: AsFd>(
     if !opened.same_object(expected) {
         return Err(DeleteError::CleanupConflict);
     }
-    remove_directory_contents_with_policy(&directory, opened, mount_check, policy)?;
+    let _ = delete_contents(directory, opened, mount_check, policy)?;
 
     // The directory must be empty and must still be the exact object moved
     // aside by this operation.  Never rmdir an unverified replacement.

@@ -13,7 +13,6 @@ use std::ops::Deref;
 
 use rustix::fd::{AsFd, BorrowedFd, OwnedFd};
 use rustix::fs::{AtFlags, FileType, Mode, OFlags, Stat, fstat, openat, statat};
-use rustix::io::fcntl_dupfd_cloexec;
 
 #[cfg(target_os = "linux")]
 use rustix::fs::{ResolveFlags, StatxFlags, openat2, statx};
@@ -142,14 +141,6 @@ impl DirectoryFd {
 
     pub(crate) fn stamp(&self) -> FileStamp {
         self.stamp
-    }
-
-    /// Duplicate this directory capability for a worker without rebuilding a
-    /// path. The duplicate carries close-on-exec and refers to the same held
-    /// parent directory.
-    pub(crate) fn try_clone(&self) -> io::Result<Self> {
-        let duplicate = fcntl_dupfd_cloexec(&self.fd, 0).map_err(io_error)?;
-        Self::from_owned(duplicate)
     }
 }
 
@@ -489,6 +480,70 @@ pub(crate) fn open_child_directory<P: AsFd>(
     Ok(DirectoryFd { fd, stamp })
 }
 
+/// Open a planned directory child and prove it is still the same object that
+/// the caller inspected before making a traversal or deletion decision.
+///
+/// [`open_child_directory`] already closes the lookup/open race against a
+/// fresh observation. This variant also closes the longer planning-to-open
+/// interval, so a same-type pathname replacement cannot become an authority
+/// for recursive work.
+pub(crate) fn open_planned_child_directory<P: AsFd>(
+    parent: P,
+    name: &[u8],
+    expected: FileStamp,
+    policy: MountPolicy,
+) -> io::Result<DirectoryFd> {
+    if expected.kind != EntryKind::Directory {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "planned entry is not a directory",
+        ));
+    }
+    let directory = open_child_directory(parent, name, policy)?;
+    if !directory.stamp().same_object(expected) {
+        return Err(io::Error::new(
+            ErrorKind::WouldBlock,
+            "directory changed after it was planned",
+        ));
+    }
+    Ok(directory)
+}
+
+/// Recover a trusted directory's parent through its held descriptor.
+///
+/// This is used only to unwind a single-child traversal chain after the child
+/// has completed. `..` is a single kernel-resolved component from an already
+/// trusted directory FD; callers must still verify the returned identity
+/// against the parent stamp captured before descent.
+pub(crate) fn open_parent_directory(directory: &DirectoryFd) -> io::Result<DirectoryFd> {
+    let fd = openat(
+        directory,
+        "..",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(io_error)?;
+    DirectoryFd::from_owned(fd)
+}
+
+/// Open an independent descriptor for the same verified directory object.
+///
+/// This is used only by APIs whose caller retains a borrowed directory
+/// capability while the implementation needs ownership to close it during a
+/// deep walk. The caller still validates the returned identity before any
+/// mutation is authorized.
+#[cfg(test)]
+pub(crate) fn reopen_directory(directory: &DirectoryFd) -> io::Result<DirectoryFd> {
+    let fd = openat(
+        directory,
+        ".",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(io_error)?;
+    DirectoryFd::from_owned(fd)
+}
+
 /// Open a child regular file with `O_NOFOLLOW`, then revalidate its identity.
 pub(crate) fn open_child_regular_file<P: AsFd>(
     parent: P,
@@ -561,6 +616,22 @@ mod tests {
         std::os::unix::fs::symlink("dir-target", path.join("dir-link")).expect("dir link");
         assert!(open_child_regular_file(&fd, b"file-link", MountPolicy::CrossFilesystems).is_err());
         assert!(open_child_directory(&fd, b"dir-link", MountPolicy::CrossFilesystems).is_err());
+        fs::remove_dir_all(path).expect("remove test root");
+    }
+
+    #[test]
+    fn planned_directory_open_rejects_a_same_type_replacement() {
+        let (path, fd) = test_root();
+        fs::create_dir(path.join("planned")).expect("create planned directory");
+        let planned =
+            stat_child(&fd, b"planned", MountPolicy::CrossFilesystems).expect("plan directory");
+        fs::rename(path.join("planned"), path.join("old")).expect("move planned directory");
+        fs::create_dir(path.join("planned")).expect("replace planned directory");
+
+        let error =
+            open_planned_child_directory(&fd, b"planned", planned, MountPolicy::CrossFilesystems)
+                .expect_err("same-type replacement must not become a traversal root");
+        assert_eq!(error.kind(), ErrorKind::WouldBlock);
         fs::remove_dir_all(path).expect("remove test root");
     }
 

@@ -1,5 +1,10 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
+// The FD-relative safety model and platform copy primitives are deliberately
+// Unix contracts. V1 does not offer a weaker path-based Windows fallback.
+#[cfg(not(unix))]
+compile_error!("fs supports Unix targets only");
+
 mod cli;
 mod error;
 mod path;

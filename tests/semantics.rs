@@ -275,6 +275,25 @@ fn printable_and_control_entry_names_are_copied_byte_for_byte() {
     }
 }
 
+#[test]
+fn verbose_mutations_report_paths_relative_to_the_selected_root() {
+    let fixture = Fixture::new();
+    fs::create_dir_all(fixture.path("source/nested")).expect("create source tree");
+    fs::write(fixture.path("source/nested/file"), b"payload").expect("write source file");
+
+    let output = fixture.run(&["cp", "--no-progress", "--verbose", "source", "destination"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("copy\tnested/file\n"),
+        "verbose output must identify the nested object, not only its leaf: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
 #[cfg(unix)]
 fn set_mtime(path: &std::path::Path, seconds: i64, nanoseconds: i64) {
     let file = fs::OpenOptions::new()
@@ -575,7 +594,7 @@ fn dry_run_reports_the_complete_non_mutating_plan() {
     for expected in [
         "update\tchange",
         "mkdir\tnew-directory",
-        "copy\tchild",
+        "copy\tnew-directory/child",
         "delete\tstale",
     ] {
         assert!(

@@ -149,7 +149,6 @@ impl Progress {
         self.cloned_bytes.fetch_add(amount, Ordering::Relaxed);
     }
 
-    #[cfg(test)]
     #[inline]
     pub fn add_hashed_bytes(&self, amount: u64) {
         self.hashed_bytes.fetch_add(amount, Ordering::Relaxed);

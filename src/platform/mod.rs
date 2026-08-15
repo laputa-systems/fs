@@ -197,6 +197,13 @@ pub(crate) fn sync_parent_directory<Fd: AsFd>(fd: Fd) -> io::Result<()> {
     rustix::fs::fsync(fd)
 }
 
+/// Persist directory metadata and directory-entry changes. Directories use
+/// ordinary `fsync` even on macOS: `F_FULLFSYNC` is the regular-file data path
+/// and is not a portable directory operation.
+pub(crate) fn sync_directory_for_durable_metadata<Fd: AsFd>(fd: Fd) -> io::Result<()> {
+    rustix::fs::fsync(fd)
+}
+
 impl CopyAttemptError {
     fn from_errno(errno: Errno) -> Self {
         if is_structural_unsupported(errno) {

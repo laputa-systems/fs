@@ -9,7 +9,8 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::io::ErrorKind;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 #[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -147,7 +148,12 @@ fn default_jobs() -> usize {
 /// namespace component.
 struct FileTask {
     source: traverse::OpenedFile,
-    destination_parent: traverse::DirectoryFd,
+    /// Shared directory capability for every file task in one directory. A
+    /// queue of sibling files must not duplicate this FD once per child.
+    destination_parent: Arc<traverse::DirectoryFd>,
+    /// Root-relative display path. Filesystem operations continue to use the
+    /// single `name` component below.
+    display_path: Vec<u8>,
     name: Vec<u8>,
     expected_source: copy::FileStamp,
     expected_destination: copy::DestinationExpectation,
@@ -156,6 +162,64 @@ struct FileTask {
     progress: Arc<Progress>,
     timestamp_resolutions: TimestampResolutionCache,
     clone_capabilities: Arc<copy::CloneCapabilityCache>,
+    completion: Option<FileCompletionTicket>,
+}
+
+/// Scoped completion accounting for the current prefix of scheduled files.
+///
+/// A directory finalizer waits for this counter rather than retaining every
+/// descendant directory FD until the whole walk ends. Each task owns a ticket,
+/// so normal completion, task failure, and queue abandonment all release the
+/// accounting exactly once when the task is dropped.
+#[derive(Default)]
+struct FileCompletion {
+    outstanding: Mutex<usize>,
+    changed: Condvar,
+}
+
+impl FileCompletion {
+    fn reserve(self: &Arc<Self>) -> FileCompletionTicket {
+        let mut outstanding = self.outstanding.lock().expect("file completion poisoned");
+        *outstanding += 1;
+        FileCompletionTicket {
+            completion: self.clone(),
+        }
+    }
+
+    fn wait_until_drained_or_cancelled(&self, cancellation: &Cancellation) -> bool {
+        const CANCELLATION_POLL: Duration = Duration::from_millis(25);
+
+        let mut outstanding = self.outstanding.lock().expect("file completion poisoned");
+        while *outstanding != 0 {
+            if cancellation.is_cancelled() {
+                return false;
+            }
+            let (next, _) = self
+                .changed
+                .wait_timeout(outstanding, CANCELLATION_POLL)
+                .expect("file completion poisoned");
+            outstanding = next;
+        }
+        !cancellation.is_cancelled()
+    }
+}
+
+struct FileCompletionTicket {
+    completion: Arc<FileCompletion>,
+}
+
+impl Drop for FileCompletionTicket {
+    fn drop(&mut self) {
+        let mut outstanding = self
+            .completion
+            .outstanding
+            .lock()
+            .expect("file completion poisoned");
+        *outstanding = outstanding
+            .checked_sub(1)
+            .expect("every file completion ticket is released once");
+        self.completion.changed.notify_all();
+    }
 }
 
 type TimestampResolutionCache =
@@ -234,53 +298,70 @@ impl FileTask {
         let source_stamp = copy::stamp_fd(&self.source).map_err(|error| {
             task_conflict(
                 "stat source file before worker",
-                &self.name,
+                &self.display_path,
                 error.to_string(),
             )
         })?;
         if !self.expected_source.source_is_stable(source_stamp) {
             return Err(task_conflict(
                 "copy",
-                &self.name,
+                &self.display_path,
                 "source changed after Phase A",
             ));
         }
         if self.destination_exists {
             let destination = traverse::open_child_regular_file(
-                &self.destination_parent,
+                self.destination_parent.as_ref(),
                 &self.name,
                 self.options.mount_policy,
             )
-            .map_err(|error| task_io("open destination file", &self.name, error))?;
+            .map_err(|error| task_io("open destination file", &self.display_path, error))?;
             let destination_identity = copy::stamp_fd(&destination).map_err(|error| {
-                task_conflict("stat destination file", &self.name, error.to_string())
+                task_conflict(
+                    "stat destination file",
+                    &self.display_path,
+                    error.to_string(),
+                )
             })?;
             let copy::DestinationExpectation::Present(expected_destination) =
                 self.expected_destination
             else {
                 return Err(task_conflict(
                     "compare regular file",
-                    &self.name,
+                    &self.display_path,
                     "destination appeared after Phase A",
                 ));
             };
             if !expected_destination.destination_is_unchanged(destination_identity) {
                 return Err(task_conflict(
                     "compare regular file",
-                    &self.name,
+                    &self.display_path,
                     "destination changed after Phase A",
                 ));
             }
             let destination_stamp = metadata::stamp_fd(&destination)
-                .map_err(|error| task_io("stat destination file", &self.name, error))?;
+                .map_err(|error| task_io("stat destination file", &self.display_path, error))?;
             let source_stamp = metadata::stamp_fd(&self.source)
-                .map_err(|error| task_io("stat source file", &self.name, error))?;
+                .map_err(|error| task_io("stat source file", &self.display_path, error))?;
             let resolution = timestamp_resolution_for(
                 &destination,
                 destination.stamp().mount,
                 &self.timestamp_resolutions,
             )
-            .map_err(|error| task_io("read destination timestamp resolution", &self.name, error))?;
+            .map_err(|error| {
+                task_io(
+                    "read destination timestamp resolution",
+                    &self.display_path,
+                    error,
+                )
+            })?;
+            let comparison_reads_hashes = source_stamp.size == destination_stamp.size
+                && (self.options.check == compare::CheckMode::Hash
+                    || metadata::compare_timestamps(
+                        source_stamp.mtime,
+                        destination_stamp.mtime,
+                        resolution,
+                    ) == TimestampComparison::Ambiguous);
             let comparison = FILE_HASH_BUFFER
                 .with(|scratch| {
                     compare::compare_regular_files(
@@ -294,31 +375,75 @@ impl FileTask {
                     )
                 })
                 .map_err(|error| {
-                    task_conflict("compare regular file", &self.name, error.to_string())
+                    task_conflict(
+                        "compare regular file",
+                        &self.display_path,
+                        error.to_string(),
+                    )
                 })?;
+            if comparison_reads_hashes {
+                self.progress
+                    .add_hashed_bytes(source_stamp.size.saturating_add(destination_stamp.size));
+            }
             self.progress.record_compared_file();
             if comparison == compare::RegularFileComparison::Equal {
+                let source_current = copy::stamp_fd(&self.source).map_err(|error| {
+                    task_conflict(
+                        "revalidate source file after comparison",
+                        &self.display_path,
+                        error.to_string(),
+                    )
+                })?;
+                if !self.expected_source.source_is_stable(source_current) {
+                    return Err(task_conflict(
+                        "revalidate source file after comparison",
+                        &self.display_path,
+                        "source changed during comparison",
+                    ));
+                }
+                let destination_current = copy::stamp_fd(&destination).map_err(|error| {
+                    task_conflict(
+                        "revalidate destination file after comparison",
+                        &self.display_path,
+                        error.to_string(),
+                    )
+                })?;
+                if !expected_destination.destination_is_unchanged(destination_current) {
+                    return Err(task_conflict(
+                        "revalidate destination file after comparison",
+                        &self.display_path,
+                        "destination changed during comparison",
+                    ));
+                }
+                copy::check_destination(
+                    self.destination_parent.as_ref(),
+                    &self.name,
+                    self.expected_destination,
+                )
+                .map_err(|error| {
+                    task_conflict(
+                        "revalidate destination name before metadata update",
+                        &self.display_path,
+                        error.to_string(),
+                    )
+                })?;
                 converge_regular_metadata(
                     self.options,
-                    &self.progress,
                     &self.source,
                     &destination,
                     RegularMetadata {
                         source_stamp,
                         destination_stamp,
                         resolution,
-                        name: &self.name,
+                        name: &self.display_path,
                     },
                 )?;
+                self.progress.record_completed_file(source_stamp.size);
                 self.progress.record_skipped_file();
                 return Ok(());
             }
         }
 
-        let source_size = metadata::stamp_fd(&self.source)
-            .map_err(|error| task_io("stat source file before copy", &self.name, error))?
-            .size;
-        self.progress.record_planned_file(source_size);
         if self.options.dry_run {
             println!(
                 "{}\t{}",
@@ -327,13 +452,19 @@ impl FileTask {
                 } else {
                     "copy"
                 },
-                display_component(&self.name)
+                display_component(&self.display_path)
             );
+            let source_size = metadata::stamp_fd(&self.source)
+                .map_err(|error| {
+                    task_io("stat source file after dry-run", &self.display_path, error)
+                })?
+                .size;
+            self.progress.record_completed_file(source_size);
             return Ok(());
         }
         let publication = copy::publish_regular_file_checked(
             &self.source,
-            &self.destination_parent,
+            self.destination_parent.as_ref(),
             &self.name,
             Some(self.expected_source),
             self.expected_destination,
@@ -342,7 +473,7 @@ impl FileTask {
                 clone_capabilities: Some(self.clone_capabilities.clone()),
             },
         )
-        .map_err(|error| task_conflict("copy", &self.name, error.to_string()))?;
+        .map_err(|error| task_conflict("copy", &self.display_path, error.to_string()))?;
         self.progress
             .record_completed_file(publication.bytes_copied);
         match publication.method {
@@ -361,7 +492,7 @@ impl FileTask {
                 } else {
                     "copy"
                 },
-                display_component(&self.name)
+                display_component(&self.display_path)
             );
         }
         Ok(())
@@ -391,7 +522,6 @@ struct RegularMetadata<'a> {
 /// equality. This deliberately does not inspect xattrs on a clean no-op.
 fn converge_regular_metadata<S: AsFd, D: AsFd>(
     options: RunOptions,
-    progress: &Progress,
     source: S,
     destination: D,
     metadata: RegularMetadata<'_>,
@@ -423,10 +553,13 @@ fn converge_regular_metadata<S: AsFd, D: AsFd>(
     }
     metadata::propagate_xattrs(&source, &destination)
         .map_err(|error| task_io("propagate file xattrs", metadata.name, error))?;
+    if options.durable {
+        crate::platform::sync_file_for_durable_publish(&destination)
+            .map_err(|error| task_io("sync file metadata", metadata.name, error))?;
+    }
     if options.verbose {
         println!("update\t{}", display_component(metadata.name));
     }
-    progress.record_completed_file(0);
     Ok(())
 }
 
@@ -436,6 +569,7 @@ fn converge_regular_metadata<S: AsFd, D: AsFd>(
 struct FileWorkers {
     sender: WorkSender<FileTask>,
     cancellation: Cancellation,
+    completion: Arc<FileCompletion>,
     group: Option<WorkerGroup>,
 }
 
@@ -450,11 +584,13 @@ impl FileWorkers {
         Self {
             sender,
             cancellation,
+            completion: Arc::new(FileCompletion::default()),
             group: Some(group),
         }
     }
 
-    fn enqueue(&self, task: FileTask) -> Result<()> {
+    fn enqueue(&self, mut task: FileTask) -> Result<()> {
+        task.completion = Some(self.completion.reserve());
         match self.sender.send(task) {
             Ok(()) => Ok(()),
             Err(SendError::Closed(_)) => Err(FsError::conflict(
@@ -468,6 +604,37 @@ impl FileWorkers {
                 "a file worker failed; remaining work was cancelled",
             )),
         }
+    }
+
+    /// Wait for the files already scheduled by the single discovery thread.
+    /// No new file work is submitted while this method runs, so zero means the
+    /// current directory subtree is safe to finalize. A failed worker returns
+    /// immediately instead of waiting for cancelled queue entries to drain.
+    fn wait_until_idle(&self) -> Result<()> {
+        if self
+            .completion
+            .wait_until_drained_or_cancelled(&self.cancellation)
+        {
+            return Ok(());
+        }
+        Err(self.cancellation_error())
+    }
+
+    fn ensure_not_cancelled(&self) -> Result<()> {
+        if self.cancellation.is_cancelled() {
+            Err(self.cancellation_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn cancellation_error(&self) -> FsError {
+        let reason = self
+            .cancellation
+            .reason()
+            .map(|reason| reason.to_string())
+            .unwrap_or_else(|| "copy worker was cancelled".to_owned());
+        FsError::conflict("copy worker", OsStr::new("."), reason)
     }
 
     fn finish(mut self) -> Result<()> {
@@ -506,12 +673,6 @@ impl Drop for FileWorkers {
     }
 }
 
-struct DirectoryFinalizer {
-    source: traverse::DirectoryFd,
-    destination: traverse::DirectoryFd,
-    name: Vec<u8>,
-}
-
 struct Engine {
     options: RunOptions,
     hash_buffer: Vec<u8>,
@@ -520,7 +681,6 @@ struct Engine {
     timestamp_resolutions: TimestampResolutionCache,
     clone_capabilities: Arc<copy::CloneCapabilityCache>,
     workers: Option<FileWorkers>,
-    deferred_directory_finalizers: Vec<DirectoryFinalizer>,
 }
 
 impl Engine {
@@ -533,7 +693,6 @@ impl Engine {
             timestamp_resolutions: Arc::new(Mutex::new(HashMap::new())),
             clone_capabilities: Arc::new(copy::CloneCapabilityCache::default()),
             workers: None,
-            deferred_directory_finalizers: Vec::new(),
         }
     }
 
@@ -549,17 +708,15 @@ impl Engine {
         Ok(())
     }
 
-    fn finalize_deferred_directories(&mut self) -> Result<()> {
-        let finalizers = std::mem::take(&mut self.deferred_directory_finalizers);
-        for finalizer in finalizers {
-            self.finalize_directory(&finalizer.source, &finalizer.destination, &finalizer.name)?;
-        }
-        Ok(())
-    }
-
     fn emit(&self, verb: &str, name: &[u8]) {
         if self.options.verbose || self.options.dry_run {
             println!("{verb}\t{}", display_component(name));
+        }
+    }
+
+    fn emit_child(&self, verb: &str, relative_parent: &[u8], name: &[u8]) {
+        if self.options.verbose || self.options.dry_run {
+            self.emit(verb, &relative_child_path(relative_parent, name));
         }
     }
 
@@ -582,9 +739,10 @@ impl Engine {
 
     fn phase_a_directory(
         &mut self,
-        source: &traverse::DirectoryFd,
-        destination: Option<&traverse::DirectoryFd>,
-    ) -> Result<()> {
+        mut source: traverse::DirectoryFd,
+        mut destination: Option<Arc<traverse::DirectoryFd>>,
+        relative_path: Vec<u8>,
+    ) -> Result<(traverse::DirectoryFd, Option<Arc<traverse::DirectoryFd>>)> {
         // A source directory is the membership proof for this portion of the
         // walk.  Check it on both sides of Phase A so an entry created,
         // removed, or renamed while this directory was being discovered does
@@ -592,23 +750,56 @@ impl Engine {
         // source view.  This is deliberately an FD re-stat: directory names
         // may be replaced concurrently, but the held descriptor remains the
         // object whose membership we inspected.
-        let source_before = traverse::stamp_fd(source)
+        let source_before = traverse::stamp_fd(&source)
             .map_err(|error| self.io("stat source directory before phase A", b".", error))?;
         #[cfg(test)]
-        mutate_source_during_phase_a_for_test(source)
+        mutate_source_during_phase_a_for_test(&source)
             .map_err(|error| self.io("mutate source during Phase A test", b".", error))?;
-        let mut entries = traverse::DirectoryEntries::open(source)
+        let mut entries = traverse::DirectoryEntries::open(&source)
             .map_err(|error| self.io("enumerate source", b".", error))?;
+        // When a child completes, re-open this verified source directory and
+        // skip through the child name before continuing. POSIX directory
+        // stream offsets are not portable across distinct `DIR *` streams,
+        // so carrying one would make the descriptor bound platform-specific.
+        // The directory stamp below proves the source membership did not
+        // change while its child was processed.
+        let mut resumed_child: Option<Vec<u8>> = None;
         while let Some(entry) = entries
             .next_entry()
             .map_err(|error| self.io("enumerate source", b".", error))?
         {
+            if let Some(child) = resumed_child.as_ref() {
+                if entry.name == *child {
+                    resumed_child = None;
+                    continue;
+                }
+                continue;
+            }
+            if let Some(workers) = self.workers.as_ref() {
+                workers.ensure_not_cancelled()?;
+            }
             self.progress.record_scanned_entry();
-            let source_stamp = traverse::stat_child(source, &entry.name, self.options.mount_policy)
-                .map_err(|error| self.io("stat source", &entry.name, error))?;
-            let destination_stamp = match destination {
+            let source_stamp =
+                traverse::stat_child(&source, &entry.name, self.options.mount_policy).map_err(
+                    |error| {
+                        if error.kind() == ErrorKind::NotFound {
+                            self.conflict(
+                                "inspect source",
+                                &entry.name,
+                                "source entry disappeared after enumeration",
+                            )
+                        } else {
+                            self.io("stat source", &entry.name, error)
+                        }
+                    },
+                )?;
+            let destination_stamp = match destination.as_ref() {
                 Some(directory) => {
-                    match traverse::stat_child(directory, &entry.name, self.options.mount_policy) {
+                    match traverse::stat_child(
+                        directory.as_ref(),
+                        &entry.name,
+                        self.options.mount_policy,
+                    ) {
                         Ok(stamp) => Some(stamp),
                         Err(error) if error.kind() == ErrorKind::NotFound => None,
                         Err(error) => return Err(self.io("stat destination", &entry.name, error)),
@@ -629,70 +820,157 @@ impl Engine {
 
             match source_stamp.kind {
                 traverse::EntryKind::Regular => self.converge_regular(
-                    source,
-                    destination,
+                    &source,
+                    destination.as_ref(),
                     &entry.name,
+                    &relative_path,
                     source_stamp,
                     destination_stamp,
                 )?,
                 traverse::EntryKind::Symlink => self.converge_symlink(
-                    source,
-                    destination,
+                    &source,
+                    destination.as_ref(),
                     &entry.name,
+                    &relative_path,
                     source_stamp,
                     destination_stamp,
-                    destination_stamp.is_some(),
                 )?,
                 traverse::EntryKind::Directory => {
-                    let source_child = traverse::open_child_directory(
-                        source,
+                    let source_child = traverse::open_planned_child_directory(
+                        &source,
                         &entry.name,
+                        source_stamp,
                         self.options.mount_policy,
                     )
                     .map_err(|error| self.io("open source directory", &entry.name, error))?;
-                    let destination_child = match destination {
-                        Some(parent) if destination_stamp.is_some() => Some(
-                            traverse::open_child_directory(
-                                parent,
-                                &entry.name,
-                                self.options.mount_policy,
-                            )
-                            .map_err(|error| {
-                                self.io("open destination directory", &entry.name, error)
-                            })?,
+                    let (destination_child, created_destination) = match destination.as_ref() {
+                        Some(parent) if destination_stamp.is_some() => (
+                            Some(Arc::new(
+                                traverse::open_planned_child_directory(
+                                    parent.as_ref(),
+                                    &entry.name,
+                                    destination_stamp.expect("existing destination has a stamp"),
+                                    self.options.mount_policy,
+                                )
+                                .map_err(|error| {
+                                    self.io("open destination directory", &entry.name, error)
+                                })?,
+                            )),
+                            false,
                         ),
                         Some(parent) => {
                             if self.options.dry_run {
-                                self.emit("mkdir", &entry.name);
-                                None
+                                self.emit_child("mkdir", &relative_path, &entry.name);
+                                (None, false)
                             } else {
-                                self.create_directory(parent, &entry.name)?
+                                (
+                                    self.create_directory(
+                                        parent.as_ref(),
+                                        &entry.name,
+                                        &relative_child_path(&relative_path, &entry.name),
+                                    )?
+                                    .map(Arc::new),
+                                    true,
+                                )
                             }
                         }
                         None => {
-                            self.emit("mkdir", &entry.name);
-                            None
+                            self.emit_child("mkdir", &relative_path, &entry.name);
+                            (None, false)
                         }
                     };
 
-                    self.phase_a_directory(&source_child, destination_child.as_ref())?;
-                    if self.options.operation == Operation::Cp
+                    // Directory xattrs are creation metadata. They must be
+                    // propagated even if the later mode/mtime finalizer finds
+                    // its two fast-path fields already equal.
+                    if created_destination
                         && let Some(destination_child) = destination_child.as_ref()
                     {
-                        if self.workers.is_some() {
-                            self.deferred_directory_finalizers.push(DirectoryFinalizer {
-                                source: source_child.try_clone().map_err(|error| {
-                                    self.io("duplicate source directory", &entry.name, error)
-                                })?,
-                                destination: destination_child.try_clone().map_err(|error| {
-                                    self.io("duplicate destination directory", &entry.name, error)
-                                })?,
-                                name: entry.name.clone(),
-                            });
-                        } else {
-                            self.finalize_directory(&source_child, destination_child, &entry.name)?;
-                        }
+                        metadata::propagate_xattrs(&source_child, destination_child.as_ref())
+                            .map_err(|error| {
+                                self.io("propagate created directory xattrs", &entry.name, error)
+                            })?;
                     }
+
+                    // Re-open and resume this directory through the child
+                    // name after it completes. Drop both parent FDs while
+                    // descending: a wide, deep tree must not consume one
+                    // descriptor per ancestor merely because each ancestor
+                    // has another sibling still to enumerate.
+                    let destination_identity =
+                        destination.as_ref().map(|directory| directory.stamp());
+                    // A dry-run never creates an absent child, so there is no
+                    // descriptor from which to climb back to this destination
+                    // parent. Retain only that dry-run capability; normal
+                    // execution always recovers the parent from its verified
+                    // child descriptor.
+                    let retained_dry_destination =
+                        if destination_child.is_none() && self.options.dry_run {
+                            destination.take()
+                        } else {
+                            None
+                        };
+                    drop(entries);
+                    drop(source);
+
+                    let child_relative_path = relative_child_path(&relative_path, &entry.name);
+                    let (source_child, destination_child) = self.phase_a_directory(
+                        source_child,
+                        destination_child,
+                        child_relative_path.clone(),
+                    )?;
+                    self.finalize_phase_a_child(
+                        &source_child,
+                        destination_child.as_deref(),
+                        &child_relative_path,
+                    )?;
+
+                    source = traverse::open_parent_directory(&source_child).map_err(|error| {
+                        self.io("open source parent after child", &entry.name, error)
+                    })?;
+                    let observed_source_parent = traverse::stamp_fd(&source).map_err(|error| {
+                        self.io("stat source parent after child", &entry.name, error)
+                    })?;
+                    if observed_source_parent != source_before {
+                        return Err(self.conflict(
+                            "copy source directory",
+                            &entry.name,
+                            "source directory changed while its child was processed",
+                        ));
+                    }
+                    destination = match (destination_child, destination_identity) {
+                        (Some(destination_child), Some(expected_parent)) => {
+                            let parent =
+                                traverse::open_parent_directory(destination_child.as_ref())
+                                    .map_err(|error| {
+                                        self.io(
+                                            "open destination parent after child",
+                                            &entry.name,
+                                            error,
+                                        )
+                                    })?;
+                            if !parent.stamp().same_object(expected_parent) {
+                                return Err(self.conflict(
+                                    "open destination parent after child",
+                                    &entry.name,
+                                    "destination parent changed while its child was processed",
+                                ));
+                            }
+                            Some(Arc::new(parent))
+                        }
+                        (None, None) => None,
+                        (None, Some(_)) if self.options.dry_run => retained_dry_destination,
+                        _ => {
+                            return Err(self.conflict(
+                                "open destination parent after child",
+                                &entry.name,
+                                "destination child state changed while it was processed",
+                            ));
+                        }
+                    };
+                    entries = traverse::DirectoryEntries::open(&source)
+                        .map_err(|error| self.io("resume source directory", &entry.name, error))?;
+                    resumed_child = Some(entry.name);
                 }
                 traverse::EntryKind::Other => {
                     return Err(self.conflict(
@@ -703,7 +981,7 @@ impl Engine {
                 }
             }
         }
-        let source_after = traverse::stamp_fd(source)
+        let source_after = traverse::stamp_fd(&source)
             .map_err(|error| self.io("stat source directory after phase A", b".", error))?;
         if source_before != source_after {
             return Err(self.conflict(
@@ -712,6 +990,23 @@ impl Engine {
                 "source directory changed during Phase A",
             ));
         }
+        Ok((source, destination))
+    }
+
+    fn finalize_phase_a_child(
+        &mut self,
+        source: &traverse::DirectoryFd,
+        destination: Option<&traverse::DirectoryFd>,
+        name: &[u8],
+    ) -> Result<()> {
+        if self.options.operation == Operation::Cp
+            && let Some(destination) = destination
+        {
+            if let Some(workers) = self.workers.as_ref() {
+                workers.wait_until_idle()?;
+            }
+            self.finalize_directory(source, destination, name)?;
+        }
         Ok(())
     }
 
@@ -719,30 +1014,43 @@ impl Engine {
         &self,
         parent: &traverse::DirectoryFd,
         name: &[u8],
+        display_path: &[u8],
     ) -> Result<Option<traverse::DirectoryFd>> {
         fs::mkdirat(parent, name, Mode::from_raw_mode(0o700)).map_err(|error| {
             if error == rustix::io::Errno::EXIST {
-                self.conflict("mkdir", name, "destination appeared during convergence")
+                self.conflict(
+                    "mkdir",
+                    display_path,
+                    "destination appeared during convergence",
+                )
             } else {
-                self.io("mkdir", name, error)
+                self.io("mkdir", display_path, error)
             }
         })?;
-        self.emit("mkdir", name);
-        traverse::open_child_directory(parent, name, self.options.mount_policy)
-            .map(Some)
-            .map_err(|error| self.io("open created directory", name, error))
+        self.emit("mkdir", display_path);
+        let directory = traverse::open_child_directory(parent, name, self.options.mount_policy)
+            .map_err(|error| self.io("open created directory", display_path, error))?;
+        if self.options.durable {
+            crate::platform::sync_directory_for_durable_metadata(&directory)
+                .map_err(|error| self.io("sync created directory", display_path, error))?;
+            crate::platform::sync_parent_directory(parent).map_err(|error| {
+                self.io("sync directory parent after mkdir", display_path, error)
+            })?;
+        }
+        Ok(Some(directory))
     }
 
     fn converge_regular(
         &mut self,
         source_parent: &traverse::DirectoryFd,
-        destination_parent: Option<&traverse::DirectoryFd>,
+        destination_parent: Option<&Arc<traverse::DirectoryFd>>,
         name: &[u8],
+        relative_parent: &[u8],
         source_stamp: traverse::FileStamp,
         destination_stamp: Option<traverse::FileStamp>,
     ) -> Result<()> {
         let Some(destination_parent) = destination_parent else {
-            self.emit("copy", name);
+            self.emit_child("copy", relative_parent, name);
             return Ok(());
         };
 
@@ -755,7 +1063,7 @@ impl Engine {
             && destination_stamp.mount == destination_parent.stamp().mount
         {
             let resolution = timestamp_resolution_for(
-                destination_parent,
+                destination_parent.as_ref(),
                 destination_stamp.mount,
                 &self.timestamp_resolutions,
             )
@@ -785,12 +1093,10 @@ impl Engine {
             .map(copy::DestinationExpectation::Present)
             .unwrap_or(copy::DestinationExpectation::Absent);
         let destination_exists = destination_stamp.is_some();
-        let destination_parent = destination_parent
-            .try_clone()
-            .map_err(|error| self.io("duplicate destination directory", name, error))?;
         let task = FileTask {
             source,
-            destination_parent,
+            destination_parent: Arc::clone(destination_parent),
+            display_path: relative_child_path(relative_parent, name),
             name: name.to_vec(),
             expected_source,
             expected_destination,
@@ -799,7 +1105,13 @@ impl Engine {
             progress: self.progress.clone(),
             timestamp_resolutions: self.timestamp_resolutions.clone(),
             clone_capabilities: self.clone_capabilities.clone(),
+            completion: None,
         };
+        // The source walker, rather than the asynchronous comparison worker,
+        // owns the progress denominator. A hash comparison can later prove
+        // this candidate unchanged, but it is still work whose completion
+        // must advance the already-frozen meter.
+        self.progress.record_planned_file(source_stamp.size);
         match self.workers.as_ref() {
             Some(workers) => workers.enqueue(task),
             None => task.run(),
@@ -817,7 +1129,6 @@ impl Engine {
     ) -> Result<()> {
         converge_regular_metadata(
             self.options,
-            &self.progress,
             source,
             destination,
             RegularMetadata {
@@ -832,27 +1143,32 @@ impl Engine {
     fn converge_symlink(
         &mut self,
         source_parent: &traverse::DirectoryFd,
-        destination_parent: Option<&traverse::DirectoryFd>,
+        destination_parent: Option<&Arc<traverse::DirectoryFd>>,
         name: &[u8],
+        relative_parent: &[u8],
         source_stamp: traverse::FileStamp,
         destination_stamp: Option<traverse::FileStamp>,
-        destination_exists: bool,
     ) -> Result<()> {
         let Some(destination_parent) = destination_parent else {
-            self.emit("copy", name);
+            self.emit_child("copy", relative_parent, name);
             return Ok(());
         };
+        let destination_exists = destination_stamp.is_some();
         if destination_exists {
             let source_target = traverse::read_symlink(source_parent, name)
                 .map_err(|error| self.io("read source symlink", name, error))?;
-            let destination_target = traverse::read_symlink(destination_parent, name)
+            let destination_target = traverse::read_symlink(destination_parent.as_ref(), name)
                 .map_err(|error| self.io("read destination symlink", name, error))?;
             if source_target == destination_target {
                 return Ok(());
             }
         }
         if self.options.dry_run {
-            self.emit(if destination_exists { "update" } else { "copy" }, name);
+            self.emit_child(
+                if destination_exists { "update" } else { "copy" },
+                relative_parent,
+                name,
+            );
             return Ok(());
         }
         let expected_source = copy::FileStamp::from_traverse(source_stamp);
@@ -863,13 +1179,18 @@ impl Engine {
         copy::publish_symlink_checked(
             source_parent,
             name,
-            destination_parent,
+            destination_parent.as_ref(),
             name,
             Some(expected_source),
             expected_destination,
+            self.publish_options(),
         )
         .map_err(|error| self.conflict("copy symlink", name, error.to_string()))?;
-        self.emit(if destination_exists { "update" } else { "copy" }, name);
+        self.emit_child(
+            if destination_exists { "update" } else { "copy" },
+            relative_parent,
+            name,
+        );
         Ok(())
     }
 
@@ -912,40 +1233,57 @@ impl Engine {
             metadata::set_mtime_fd(destination, source_stamp.mtime)
                 .map_err(|error| self.io("set directory mtime", name, error))?;
         }
+        if self.options.durable {
+            crate::platform::sync_directory_for_durable_metadata(destination)
+                .map_err(|error| self.io("sync directory metadata", name, error))?;
+        }
         self.emit("update", name);
         Ok(())
     }
 
     fn prune_directory(
         &mut self,
-        source: &traverse::DirectoryFd,
-        destination: &traverse::DirectoryFd,
-    ) -> Result<()> {
-        let source_before = traverse::stamp_fd(source)
+        mut source: traverse::DirectoryFd,
+        mut destination: traverse::DirectoryFd,
+    ) -> Result<(traverse::DirectoryFd, traverse::DirectoryFd)> {
+        let source_before = traverse::stamp_fd(&source)
             .map_err(|error| self.io("stat source before prune", b".", error))?;
         #[cfg(test)]
-        mutate_source_during_prune_for_test(source)
+        mutate_source_during_prune_for_test(&source)
             .map_err(|error| self.io("mutate source during prune test", b".", error))?;
-        let mut entries = traverse::DirectoryEntries::open(destination)
+        let mut entries = traverse::DirectoryEntries::open(&destination)
             .map_err(|error| self.io("enumerate destination for prune", b".", error))?;
+        // See the matching Phase A continuation: directory-stream offsets
+        // cannot be carried across a closed POSIX stream, so resume by
+        // re-enumerating this unchanged destination directory through the
+        // child that was just completed. This releases ancestor descriptors
+        // before descending into a matching subtree.
+        let mut resumed_child: Option<Vec<u8>> = None;
         while let Some(entry) = entries
             .next_entry()
             .map_err(|error| self.io("enumerate destination for prune", b".", error))?
         {
+            if let Some(child) = resumed_child.as_ref() {
+                if entry.name == *child {
+                    resumed_child = None;
+                    continue;
+                }
+                continue;
+            }
             self.progress.record_scanned_entry();
             let destination_stamp =
-                traverse::stat_child(destination, &entry.name, self.options.mount_policy)
+                traverse::stat_child(&destination, &entry.name, self.options.mount_policy)
                     .map_err(|error| self.io("stat destination for prune", &entry.name, error))?;
             let source_stamp =
-                match traverse::stat_child(source, &entry.name, self.options.mount_policy) {
+                match traverse::stat_child(&source, &entry.name, self.options.mount_policy) {
                     Ok(stamp) => Some(stamp),
                     Err(error) if error.kind() == ErrorKind::NotFound => None,
                     Err(error) => return Err(self.io("stat source for prune", &entry.name, error)),
                 };
             match source_stamp {
                 None => self.remove_destination_only(
-                    source,
-                    destination,
+                    &source,
+                    &destination,
                     &entry.name,
                     destination_stamp,
                 )?,
@@ -958,17 +1296,19 @@ impl Engine {
                         ));
                     }
                     if source_stamp.kind == traverse::EntryKind::Directory {
-                        let source_child = traverse::open_child_directory(
-                            source,
+                        let source_child = traverse::open_planned_child_directory(
+                            &source,
                             &entry.name,
+                            source_stamp,
                             self.options.mount_policy,
                         )
                         .map_err(|error| {
                             self.io("open source directory during prune", &entry.name, error)
                         })?;
-                        let destination_child = traverse::open_child_directory(
-                            destination,
+                        let destination_child = traverse::open_planned_child_directory(
+                            &destination,
                             &entry.name,
+                            destination_stamp,
                             self.options.mount_policy,
                         )
                         .map_err(|error| {
@@ -978,17 +1318,64 @@ impl Engine {
                                 error,
                             )
                         })?;
-                        self.prune_directory(&source_child, &destination_child)?;
+                        let expected_destination_parent = destination.stamp();
+                        drop(entries);
+                        drop(source);
+                        drop(destination);
+                        let (source_child, destination_child) =
+                            self.prune_directory(source_child, destination_child)?;
+
+                        source =
+                            traverse::open_parent_directory(&source_child).map_err(|error| {
+                                self.io("open source parent after prune child", &entry.name, error)
+                            })?;
+                        let observed_source_parent =
+                            traverse::stamp_fd(&source).map_err(|error| {
+                                self.io("stat source parent after prune child", &entry.name, error)
+                            })?;
+                        if observed_source_parent != source_before {
+                            return Err(self.conflict(
+                                "prune",
+                                &entry.name,
+                                "source directory changed while its child was pruned",
+                            ));
+                        }
+                        destination = traverse::open_parent_directory(&destination_child).map_err(
+                            |error| {
+                                self.io(
+                                    "open destination parent after prune child",
+                                    &entry.name,
+                                    error,
+                                )
+                            },
+                        )?;
+                        if !destination.stamp().same_object(expected_destination_parent) {
+                            return Err(self.conflict(
+                                "prune",
+                                &entry.name,
+                                "destination directory changed while its child was pruned",
+                            ));
+                        }
+                        entries =
+                            traverse::DirectoryEntries::open(&destination).map_err(|error| {
+                                self.io(
+                                    "resume destination directory for prune",
+                                    &entry.name,
+                                    error,
+                                )
+                            })?;
+                        resumed_child = Some(entry.name);
                     }
                 }
             }
         }
-        let source_after = traverse::stamp_fd(source)
+        let source_after = traverse::stamp_fd(&source)
             .map_err(|error| self.io("stat source after prune", b".", error))?;
         if source_before != source_after {
             return Err(self.conflict("prune", b".", "source directory changed during sync prune"));
         }
-        self.finalize_directory(source, destination, b".")
+        self.finalize_directory(&source, &destination, b".")?;
+        Ok((source, destination))
     }
 
     fn remove_destination_only(
@@ -1038,6 +1425,10 @@ impl Engine {
             .map_err(|error| {
                 self.conflict("delete destination-only entry", name, error.to_string())
             })?;
+        }
+        if self.options.durable {
+            crate::platform::sync_parent_directory(destination_parent)
+                .map_err(|error| self.io("sync directory parent after delete", name, error))?;
         }
         self.emit("delete", name);
         self.progress.record_deleted_entry();
@@ -1171,7 +1562,12 @@ fn execute_directory_root(engine: &mut Engine, source: &Root, destination: &Root
             "source root changed between establishment and open",
         ));
     }
-    let destination = match destination.metadata().map(|metadata| metadata.kind) {
+    let destination_root_parent = destination.parent_fd();
+    let destination_root_leaf = os_bytes(destination.leaf()).to_vec();
+    let (destination, destination_created) = match destination
+        .metadata()
+        .map(|metadata| metadata.kind)
+    {
         Some(RootEntryKind::Directory) => {
             let directory = traverse::DirectoryFd::from_owned(
                 destination.open_directory("open destination root")?,
@@ -1195,7 +1591,7 @@ fn execute_directory_root(engine: &mut Engine, source: &Root, destination: &Root
                     "destination root changed between establishment and open",
                 ));
             }
-            Some(directory)
+            (Some(Arc::new(directory)), false)
         }
         Some(_) => {
             return Err(FsError::conflict(
@@ -1206,7 +1602,7 @@ fn execute_directory_root(engine: &mut Engine, source: &Root, destination: &Root
         }
         None if engine.options.dry_run => {
             engine.emit("mkdir", os_bytes(destination.leaf()));
-            None
+            (None, false)
         }
         None => {
             if !matches!(expected_destination, copy::DestinationExpectation::Absent) {
@@ -1229,44 +1625,62 @@ fn execute_directory_root(engine: &mut Engine, source: &Root, destination: &Root
                 )
             })?;
             engine.emit("mkdir", os_bytes(destination.leaf()));
-            Some(
-                open_directory_from_root(destination, engine.options.mount_policy)
-                    .map_err(|error| engine.io("open created destination root", b".", error))?,
+            (
+                Some(Arc::new(
+                    open_directory_from_root(destination, engine.options.mount_policy)
+                        .map_err(|error| engine.io("open created destination root", b".", error))?,
+                )),
+                true,
             )
         }
     };
+    if destination_created && let Some(destination) = destination.as_ref() {
+        metadata::propagate_xattrs(&source, destination.as_ref())
+            .map_err(|error| engine.io("propagate created root directory xattrs", b".", error))?;
+        if engine.options.durable {
+            crate::platform::sync_directory_for_durable_metadata(destination.as_ref())
+                .map_err(|error| engine.io("sync created root directory", b".", error))?;
+            crate::platform::sync_parent_directory(destination_root_parent).map_err(|error| {
+                engine.io(
+                    "sync root parent after mkdir",
+                    &destination_root_leaf,
+                    error,
+                )
+            })?;
+        }
+    }
     // Keep a root-level Phase A stamp as well as the per-directory stamps in
     // `phase_a_directory`.  The second check below covers the narrow interval
     // after discovery and worker completion but before Phase B begins.
-    let source_before_phase_a = if engine.options.operation == Operation::Sync {
-        Some(
-            traverse::stamp_fd(&source)
-                .map_err(|error| engine.io("stat source root before Phase A", b".", error))?,
-        )
-    } else {
-        None
-    };
+    let source_before_phase_a = traverse::stamp_fd(&source)
+        .map_err(|error| engine.io("stat source root before Phase A", b".", error))?;
 
     engine.start_file_workers();
-    engine.phase_a_directory(&source, destination.as_ref())?;
-    // Discovery is complete as soon as the walker has scheduled every file.
-    // Workers may still be copying, but the renderer can now use the stable
-    // planned-work denominator instead of remaining indeterminate until join.
+    let (source, destination) = engine.phase_a_directory(source, destination, Vec::new())?;
+    // Phase A has now discovered every candidate file. Workers may still be
+    // comparing or publishing them, but they never extend this denominator,
+    // so the renderer can become determinate without a backwards percentage.
     engine.progress.set_discovery_done(true);
     engine.finish_file_workers()?;
-    if let Some(destination) = destination.as_ref() {
+    let source_after_phase_a = traverse::stamp_fd(&source)
+        .map_err(|error| engine.io("revalidate source root after Phase A", b".", error))?;
+    if source_before_phase_a != source_after_phase_a {
+        return Err(engine.conflict(
+            "copy source root",
+            b".",
+            "source root changed during Phase A",
+        ));
+    }
+    if let Some(destination) = destination {
         match engine.options.operation {
             Operation::Cp => {
-                engine.finalize_deferred_directories()?;
-                engine.finalize_directory(&source, destination, b".")?;
+                engine.finalize_directory(&source, destination.as_ref(), b".")?;
             }
             Operation::Sync => {
-                let source_phase_a = source_before_phase_a
-                    .expect("sync always captures a source root Phase A stamp");
                 let source_before_prune = traverse::stamp_fd(&source).map_err(|error| {
                     engine.io("revalidate source root before prune", b".", error)
                 })?;
-                if source_phase_a != source_before_prune {
+                if source_before_phase_a != source_before_prune {
                     return Err(engine.conflict(
                         "sync",
                         b".",
@@ -1274,9 +1688,16 @@ fn execute_directory_root(engine: &mut Engine, source: &Root, destination: &Root
                     ));
                 }
                 engine.progress.set_prune_active(true);
-                let prune_result = engine.prune_directory(&source, destination);
+                let destination = Arc::try_unwrap(destination).map_err(|_| {
+                    engine.conflict(
+                        "prune",
+                        b".",
+                        "destination root is still referenced by copy work",
+                    )
+                })?;
+                let prune_result = engine.prune_directory(source, destination);
                 engine.progress.set_prune_active(false);
-                prune_result?;
+                let _ = prune_result?;
             }
         }
     }
@@ -1398,6 +1819,46 @@ fn execute_regular_root(engine: &mut Engine, source: &Root, destination: &Root) 
             )
         })?;
         if comparison == compare::RegularFileComparison::Equal {
+            let source_current = copy::stamp_fd(&source_fd).map_err(|error| {
+                engine.conflict(
+                    "revalidate source root file after comparison",
+                    os_bytes(source.leaf()),
+                    error.to_string(),
+                )
+            })?;
+            if !expected_source.source_is_stable(source_current) {
+                return Err(engine.conflict(
+                    "revalidate source root file after comparison",
+                    os_bytes(source.leaf()),
+                    "source changed during comparison",
+                ));
+            }
+            let destination_current = copy::stamp_fd(&destination_fd).map_err(|error| {
+                engine.conflict(
+                    "revalidate destination root file after comparison",
+                    os_bytes(destination.leaf()),
+                    error.to_string(),
+                )
+            })?;
+            if !expected_destination_stamp.destination_is_unchanged(destination_current) {
+                return Err(engine.conflict(
+                    "revalidate destination root file after comparison",
+                    os_bytes(destination.leaf()),
+                    "destination changed during comparison",
+                ));
+            }
+            copy::check_destination(
+                destination.parent_fd(),
+                os_bytes(destination.leaf()),
+                expected_destination,
+            )
+            .map_err(|error| {
+                engine.conflict(
+                    "revalidate destination root name before metadata update",
+                    os_bytes(destination.leaf()),
+                    error.to_string(),
+                )
+            })?;
             return engine.converge_regular_metadata(
                 &source_fd,
                 &destination_fd,
@@ -1497,6 +1958,7 @@ fn execute_symlink_root(engine: &mut Engine, source: &Root, destination: &Root) 
         os_bytes(destination.leaf()),
         Some(expected_source),
         expected_destination,
+        engine.publish_options(),
     )
     .map_err(|error| {
         engine.conflict(
@@ -1541,6 +2003,20 @@ fn os_name(value: &[u8]) -> OsString {
 
 fn display_component(value: &[u8]) -> String {
     crate::error::escape_os(&os_name(value))
+}
+
+/// Build a relative display path lazily for an operation that is already
+/// visible or queued. Namespace lookups never receive this multi-component
+/// representation.
+fn relative_child_path(parent: &[u8], name: &[u8]) -> Vec<u8> {
+    if parent.is_empty() {
+        return name.to_vec();
+    }
+    let mut path = Vec::with_capacity(parent.len() + 1 + name.len());
+    path.extend_from_slice(parent);
+    path.push(b'/');
+    path.extend_from_slice(name);
+    path
 }
 
 #[cfg(test)]
@@ -1906,7 +2382,8 @@ mod tests {
         std_fs::write(destination_path.join("file"), b"third-party update").unwrap();
         let task = FileTask {
             source,
-            destination_parent: destination_parent.try_clone().unwrap(),
+            destination_parent: Arc::new(destination_parent),
+            display_path: b"file".to_vec(),
             name: b"file".to_vec(),
             expected_source: copy::FileStamp::from_traverse(source_stamp),
             expected_destination: copy::DestinationExpectation::Present(
@@ -1925,6 +2402,7 @@ mod tests {
             progress: Arc::new(Progress::new()),
             timestamp_resolutions: Arc::new(Mutex::new(HashMap::new())),
             clone_capabilities: Arc::new(copy::CloneCapabilityCache::default()),
+            completion: None,
         };
         let error = task
             .run()
