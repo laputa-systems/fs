@@ -387,6 +387,6 @@ pub(crate) fn buffered_copy<SrcFd: AsFd, DstFd: AsFd>(
 fn is_structural_unsupported(errno: Errno) -> bool {
     matches!(
         errno,
-        Errno::XDEV | Errno::NOSYS | Errno::NOTSUP | Errno::OPNOTSUPP
+        Errno::XDEV | Errno::NOSYS | Errno::NOTSUP
     )
 }

@@ -109,11 +109,15 @@ impl FileStamp {
             mode: stat.st_mode as u32,
             mtime: Timestamp {
                 seconds: stat.st_mtime,
-                nanoseconds: stat.st_mtime_nsec,
+                // `rustix::fs::Stat` mirrors the platform libc ABI.  glibc
+                // exposes the sub-second fields as signed values while musl
+                // exposes them as unsigned values; nanoseconds are always
+                // non-negative and fit in an `i64` on both ABIs.
+                nanoseconds: stat.st_mtime_nsec as i64,
             },
             ctime: Timestamp {
                 seconds: stat.st_ctime,
-                nanoseconds: stat.st_ctime_nsec,
+                nanoseconds: stat.st_ctime_nsec as i64,
             },
         }
     }

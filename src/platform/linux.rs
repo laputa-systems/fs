@@ -61,6 +61,6 @@ pub(crate) fn try_copy_file_range<SrcFd: AsFd, DstFd: AsFd>(
 fn is_structural_unsupported(errno: Errno) -> bool {
     matches!(
         errno,
-        Errno::XDEV | Errno::NOSYS | Errno::NOTSUP | Errno::OPNOTSUPP
+        Errno::XDEV | Errno::NOSYS | Errno::NOTSUP
     )
 }

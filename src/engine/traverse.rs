@@ -192,11 +192,14 @@ fn stamp_from_stat(stat: &Stat, mount: MountIdentity) -> FileStamp {
         size: stat.st_size.max(0) as u64,
         mtime: Timestamp {
             seconds: stat.st_mtime,
-            nanoseconds: stat.st_mtime_nsec,
+            // musl declares these fields as unsigned while glibc declares
+            // them as signed.  The POSIX nanosecond range is non-negative
+            // and well within `i64` on either ABI.
+            nanoseconds: stat.st_mtime_nsec as i64,
         },
         ctime: Timestamp {
             seconds: stat.st_ctime,
-            nanoseconds: stat.st_ctime_nsec,
+            nanoseconds: stat.st_ctime_nsec as i64,
         },
         mount,
     }
@@ -205,7 +208,11 @@ fn stamp_from_stat(stat: &Stat, mount: MountIdentity) -> FileStamp {
 #[cfg(target_os = "linux")]
 fn mount_id_at<P: AsFd>(parent: P, name: &CStr) -> io::Result<Option<u64>> {
     match statx(parent, name, AtFlags::SYMLINK_NOFOLLOW, StatxFlags::MNT_ID) {
-        Ok(result) if result.stx_mask.contains(StatxFlags::MNT_ID) => Ok(Some(result.stx_mnt_id)),
+        Ok(result)
+            if StatxFlags::from_bits_retain(result.stx_mask).contains(StatxFlags::MNT_ID) =>
+        {
+            Ok(Some(result.stx_mnt_id))
+        }
         Ok(_) => Ok(None),
         Err(Errno::NOSYS) => Ok(None),
         Err(error) => Err(io_error(error)),
@@ -230,11 +237,27 @@ fn mount_identity_for_fd<P: AsFd>(fd: P, stat: &Stat) -> io::Result<MountIdentit
     #[cfg(not(target_os = "linux"))]
     let _ = fd;
     #[cfg(target_os = "linux")]
-    let dot = CString::new(".").expect("literal has no NUL");
+    let mount_id = {
+        // `fd` may be a regular file, not just a directory.  Asking statx
+        // for `.` relative to such a descriptor fails with `ENOTDIR`; the
+        // empty-path form asks the kernel about the descriptor itself and
+        // works for every object type.
+        let empty = CStr::from_bytes_with_nul(b"\0").expect("literal has NUL");
+        match statx(fd.as_fd(), empty, AtFlags::EMPTY_PATH, StatxFlags::MNT_ID) {
+            Ok(result)
+                if StatxFlags::from_bits_retain(result.stx_mask)
+                    .contains(StatxFlags::MNT_ID) =>
+            {
+                Some(result.stx_mnt_id)
+            }
+            Ok(_) | Err(Errno::NOSYS) => None,
+            Err(error) => return Err(io_error(error)),
+        }
+    };
     Ok(MountIdentity {
         device: stat.st_dev as u64,
         #[cfg(target_os = "linux")]
-        mount_id: mount_id_at(fd, &dot)?,
+        mount_id,
     })
 }
 
@@ -603,7 +626,7 @@ mod tests {
         })
         .expect("enumerate");
         entries.sort_unstable();
-        assert_eq!(entries, vec![b"plain".to_vec(), vec![b'a', 0x80, b'b']]);
+        assert_eq!(entries, vec![vec![b'a', 0x80, b'b'], b"plain".to_vec()]);
         fs::remove_dir_all(path).expect("remove test root");
     }
 

@@ -509,6 +509,18 @@ fn dry_run_preserves_destination_bytes_metadata_and_private_namespace() {
     fs::create_dir(fixture.path("destination")).unwrap();
     fs::write(fixture.path("destination/file"), b"old").unwrap();
     fs::write(fixture.path("destination/stale"), b"stale").unwrap();
+    // Creation can land source and destination files in the same timestamp
+    // tick on Linux filesystems.  Make the metadata difference explicit so
+    // this dry-run assertion does not depend on scheduler timing.
+    #[cfg(unix)]
+    {
+        set_mtime(fixture.path("source/file").as_path(), 1_700_000_000, 0);
+        set_mtime(
+            fixture.path("destination/file").as_path(),
+            1_600_000_000,
+            0,
+        );
+    }
     #[cfg(unix)]
     fs::set_permissions(
         fixture.path("destination/file"),
@@ -576,6 +588,15 @@ fn dry_run_reports_the_complete_non_mutating_plan() {
     fs::create_dir(fixture.path("destination")).unwrap();
     fs::write(fixture.path("destination/change"), b"old").unwrap();
     fs::write(fixture.path("destination/stale"), b"stale").unwrap();
+    #[cfg(unix)]
+    {
+        set_mtime(fixture.path("source/change").as_path(), 1_700_000_000, 0);
+        set_mtime(
+            fixture.path("destination/change").as_path(),
+            1_600_000_000,
+            0,
+        );
+    }
 
     let output = fixture.run(&[
         "sync",
