@@ -38,9 +38,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.runner }}-${{ matrix.target }}
+      - uses: laputa-systems/setup-rust@a7d09bfe692e431e6a98cd107ac2df77d47b5bba
 
       - name: Build release
         run: >-
