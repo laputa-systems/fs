@@ -37,13 +37,10 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-
       - uses: laputa-systems/setup-rust@a7d09bfe692e431e6a98cd107ac2df77d47b5bba
 
       - name: Build release
-        run: >-
-          cargo build --locked --release -p fs
-          --target "${{ matrix.target }}"
+        run: cargo build --locked --release -p fs --target "${{ matrix.target }}"
 
       - name: Package binary
         run: cp "target/${{ matrix.target }}/release/fs" "fs-${{ matrix.target }}"
@@ -67,20 +64,10 @@ jobs:
           pattern: fs-*
           path: dist
           merge-multiple: true
-
       - name: Zip artifacts
-        run: |
-          for f in dist/*; do
-            zip -9 --junk-paths "$f.zip" "$f"
-          done
-
+        run: for f in dist/*; do zip -9 --junk-paths "$f.zip" "$f"; done
       - name: Create pre-release
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: release-${{ github.sha }}
-        run: >-
-          gh release create "$RELEASE_TAG" dist/*.zip
-          --repo "$GITHUB_REPOSITORY"
-          --prerelease
-          --target "$GITHUB_SHA"
-          --title "$RELEASE_TAG"
+        run: gh release create "$RELEASE_TAG" dist/*.zip --repo "$GITHUB_REPOSITORY" --prerelease --target "$GITHUB_SHA" --title "$RELEASE_TAG"
