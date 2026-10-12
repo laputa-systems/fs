@@ -18,6 +18,16 @@ fn concurrent_readers_observe_only_complete_old_or_new_publications() {
     let new = vec![b'n'; 4 * 1024 * 1024];
     fs::write(&source, &new).expect("write source");
     fs::write(&destination, &old).expect("write destination");
+    // `cp` treats equal size and equal mtime as already converged.  Both files
+    // are written back to back, so on a coarse kernel clock their mtimes can
+    // tie and the copy would be skipped.  Age the destination so publication
+    // always happens.
+    fs::File::options()
+        .write(true)
+        .open(&destination)
+        .expect("open destination")
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(60))
+        .expect("age destination");
 
     let mut child = fixture
         .command()
