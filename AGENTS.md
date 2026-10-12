@@ -168,11 +168,12 @@ FIFOs, Windows support, a TUI, JSON output, or plugins.
 Run the narrowest relevant check first, then broaden it as needed:
 
 ```text
-cargo test --all-targets
-docker build -t fs-alpine-test .
+make test
+docker build -t fs-builder .
 ```
 
-The Alpine Dockerfile is the Linux/musl test path. Do not weaken safety or
+The Dockerfile is the Linux/musl release image; inside it, `make test-ci`
+runs the suite against the musl target. Do not weaken safety or
 semantic tests to accommodate a platform; make platform assumptions explicit in
 the relevant code, test, or [`TODO.md`](TODO.md) entry.
 
