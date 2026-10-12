@@ -697,6 +697,11 @@ mod tests {
 
         let fd = open_root(&root);
         let file_stamp = stamp_at(&fd, b"file").expect("stamp");
+        // Identity is (device, inode, kind), and filesystems such as tmpfs
+        // and overlayfs may hand a freed inode straight to the next create.
+        // A second hard link keeps the original inode allocated so the
+        // replacement is guaranteed to be a different object.
+        std_fs::hard_link(root.join("file"), root.join("original")).expect("pin inode");
         std_fs::remove_file(root.join("file")).expect("replace file");
         std_fs::write(root.join("file"), b"replacement").expect("replacement");
         assert!(matches!(
