@@ -19,7 +19,7 @@ unfinished work is tracked in [`TODO.md`](TODO.md).
 ```sh
 make build                  # debug build
 make test                   # cargo test
-make lint                   # cargo fmt + clippy --fix
+make lint                   # clippy --fix
 make release                # static release build (build-std, immediate-abort panics)
 make install                # release build copied to ~/usr/bin
 ```
