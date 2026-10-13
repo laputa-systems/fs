@@ -6,9 +6,10 @@ not a feature wishlist.
 
 ## Performance evidence
 
-- Run the full release benchmark set from `scripts/bench.sh` and record results
-  for startup, metadata no-op, initial small-file copy, large-file copy, mixed
-  trees, hash mode, and progress overhead.
+- Extend `scripts/bench.sh` to measure startup, metadata no-op, small and large
+  copies, mixed trees, hash mode, and progress overhead, then record release
+  results. It currently measures population, metadata and hash no-op runs, and
+  a one-file change in a generated flat tree.
 - Profile representative macOS and Linux runs for duplicate stats, unnecessary
   opens, FD duplication, queue contention, failed clone attempts, allocations,
   and progress-rendering overhead.
@@ -28,14 +29,15 @@ not a feature wishlist.
 
 - Expand the adversarial symlink, source-mutation, and destination-mutation
   suites into repeated stress runs suitable for release qualification.
-- Run the bounded-FD and million-entry-scale checks under representative Linux
-  and macOS resource limits, then retain the measured results.
+- Bound dry-run buffering for very wide directories without creating a
+  temporary filesystem object.
+- Repeat the existing bounded-FD checks and add a million-entry-scale check
+  under representative Linux and macOS resource limits; retain the results.
 - Document the benchmark and platform-validation evidence alongside release
   artifacts.
 
 ## Explicitly deferred, not TODO
 
-Sparse extent preservation, hard-link topology, ACL/ownership preservation,
-remote transfer, persistent indexes, resume databases, configuration files,
-include/exclude rules, JSON/TUI output, and Windows support remain intentional
-non-goals. They should not be implemented merely to empty this file.
+Sparse and hard-link preservation, ACL/ownership, remote transfer, persistent
+state, configuration and include/exclude rules, JSON/TUI output, and Windows
+support remain deferred. They are not active tasks.

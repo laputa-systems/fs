@@ -1,30 +1,59 @@
 # fs
 
-A small, safe, fast filesystem convergence tool for macOS and Linux.
+`fs` copies or synchronizes files and directories on macOS and Linux.
 
 ```sh
-fs cp [OPTIONS] SRC DST     # overlay SRC onto DST, keeping destination-only entries
-fs sync [OPTIONS] SRC DST   # converge DST to SRC, pruning destination-only entries
+fs cp [OPTIONS] SRC DST
+fs sync [OPTIONS] SRC DST
 ```
 
-Options: `-n/--dry-run`, `-v/--verbose`, `-j/--jobs N`, `--check=metadata|hash`,
-`--durable`, `--cross-file-systems`, `--no-progress`, `-h/--help`, `-V/--version`.
+`cp` overlays the source onto the destination and keeps destination-only
+entries. `sync` removes destination-only entries after the source has been
+copied successfully.
 
-Directory traversal is descriptor-relative and never follows symlinks, and files
-are published by atomic rename. The full contract is in [`AGENTS.md`](AGENTS.md);
-unfinished work is tracked in [`TODO.md`](TODO.md).
+## Install
 
-## Development
+Download a matching archive from [GitHub Releases](https://github.com/laputa-systems/fs/releases),
+unpack it, rename the executable to `fs`, and put it on your `PATH`. Prebuilt
+releases target Apple Silicon macOS and x86_64 or aarch64 Linux on musl; Linux
+has dynamic and static variants. The current workflow does not build an Intel
+macOS archive.
+
+## Use
 
 ```sh
-make build                  # debug build
-make test                   # cargo test
-make lint                   # clippy --fix
-make release                # static release build (build-std, immediate-abort panics)
-make install                # release build copied to ~/usr/bin
+fs cp ./project ./backup
+fs sync --check=hash ./photos ./archive
 ```
 
-`make release-dynamic`, `make verify-release`, and `make verify-release-dynamic`
-are used by the Linux release image (`Dockerfile`) and the release workflow.
-`TARGET` selects the target triple; it defaults to the host, with Linux hosts
-mapped to musl.
+Directories are copied as tree roots; their basename is not added to the
+destination. Trailing slashes have no effect. The destination's parent
+directories must already exist, though the final destination may be absent.
+The same source and destination is a no-op. Overlapping directory trees fail
+before mutation.
+
+Only regular files, directories, and symlinks are supported. Intermediate
+symlinks are rejected and symlinks are never followed. A final source symlink
+is copied as a symlink. Type conflicts fail rather than replacing one kind of
+object with another.
+
+## Options
+
+| Option | Effect |
+| --- | --- |
+| `-n`, `--dry-run` | Report planned operations without changing the filesystem or creating temporary objects. |
+| `-v`, `--verbose` | Print operations to stdout; real runs report completed mutations. |
+| `-j N`, `--jobs N` | Set the worker count; `N` must be positive. By default it is chosen automatically and clamped to 2–8. |
+| `--check=metadata` | Compare file size, mode, and destination-normalized modification time. This is the default. |
+| `--check=hash` | Compare file contents with BLAKE3. |
+| `--durable` | Synchronize file data and metadata before publication and the parent directory after namespace changes. |
+| `--cross-file-systems` | Allow traversal across filesystem mount boundaries. |
+| `--no-progress` | Disable interactive progress output. |
+| `-h`, `--help` | Show command syntax and options. |
+| `-V`, `--version` | Show the version. |
+
+Diagnostics and progress use stderr. Progress is shown only when stderr is a
+terminal. Normal publication is atomic; `--durable` adds synchronization for
+stronger crash durability.
+
+See [`LICENSE`](LICENSE) for the MIT license.

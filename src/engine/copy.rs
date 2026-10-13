@@ -30,9 +30,7 @@ use rustix::io::Errno;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-// Keep the worker-owned buffered fallback in the documented benchmark range:
-// 256 KiB is large enough for modern local filesystems without making `-j 8`
-// consume an unreasonable amount of resident memory.
+// Keep the reusable worker-owned fallback buffer bounded at 256 KiB per worker.
 const COPY_BUFFER_SIZE: usize = 256 * 1024;
 
 thread_local! {
@@ -358,9 +356,9 @@ fn cleanup_unadopted_entry<P: AsFd + ?Sized, Fd: AsFd>(
 /// The guard never recursively follows its name.  Before cleanup it performs
 /// a no-follow stat and compares the exact `(dev, ino, type)` captured after
 /// creation.  If a separate process replaced the name, cleanup declines to
-/// unlink it.  POSIX still permits a narrow replacement after this recheck and
-/// before `unlinkat`; this is the residual namespace race documented by the
-/// design, but no operation here ever follows an unverified replacement.
+/// unlink it. POSIX still permits a narrow replacement after this recheck and
+/// before `unlinkat`, but no operation here ever follows an unverified
+/// replacement.
 pub(crate) struct TempGuard<'a, P: AsFd + ?Sized> {
     parent: &'a P,
     name: Vec<u8>,

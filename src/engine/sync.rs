@@ -437,8 +437,8 @@ fn mutate_source_during_phase_a_for_test(source: &traverse::DirectoryFd) -> std:
     Ok(())
 }
 
-/// Deterministic regression seam for the documented live-source prune
-/// boundary. Production builds contain no hook: the test asks this function
+/// Deterministic regression seam for the live-source prune boundary.
+/// Production builds contain no hook: the test asks this function
 /// to mutate one specific source directory through its already-held FD after
 /// the before-stamp and before destination membership is examined.
 #[cfg(test)]
