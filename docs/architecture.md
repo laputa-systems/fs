@@ -20,8 +20,11 @@ Regular-file work uses the bounded queue in
 [`src/workers.rs`](../src/workers.rs), with reusable per-worker buffers.
 During real runs, directory work spills from memory to an anonymous spool
 when it grows, and completed directory scopes release their descriptors.
-Dry runs avoid temporary objects, so a wide directory's records remain in
-memory; bounding that case is still open work.
+Dry runs stream child directories without retaining wide-directory records or
+creating temporary objects. They keep streams open for at most 32 ancestor
+levels; deeper directories are rescanned to select each next name. This keeps
+memory and descriptor use bounded, with quadratic read work for unusually deep
+wide directories.
 
 [`src/progress.rs`](../src/progress.rs) renders a delayed terminal meter on
 stderr. It is disabled by `--no-progress` and when stderr is not a terminal.

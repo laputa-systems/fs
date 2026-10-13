@@ -126,6 +126,157 @@ fn cp_finalizes_wide_directory_trees_with_bounded_file_descriptors() {
     }
 }
 
+/// Dry-run Phase A and prune must stream wide directory children rather than
+/// retaining one record per child or creating anonymous spool files. Linux
+/// applies a small data-segment limit so record growth becomes observable.
+#[cfg(unix)]
+#[test]
+fn sync_dry_run_streams_wide_directories_without_temporary_objects() {
+    let fixture = Fixture::new();
+    let source = fixture.root().join("source");
+    let destination = fixture.root().join("destination");
+    fs::create_dir(&source).expect("create source");
+    fs::create_dir(&destination).expect("create destination");
+    let directory_count = if cfg!(target_os = "linux") {
+        50_000
+    } else {
+        2_048
+    };
+    for index in 0..directory_count {
+        fs::create_dir(source.join(format!("directory-{index}")))
+            .expect("create source child");
+        fs::write(destination.join(format!("stale-{index}")), b"stale")
+            .expect("create destination-only file");
+    }
+
+    let mut command = fixture.command();
+    command.args([
+        "sync",
+        "--dry-run",
+        "--no-progress",
+        "-j",
+        "1",
+        "source",
+        "destination",
+    ]);
+    // SAFETY: `pre_exec` runs only in the spawned child before `exec`. The
+    // closure applies resource limits with `setrlimit` and returns an I/O
+    // error if the kernel rejects either limit.
+    unsafe {
+        command.pre_exec(|| {
+            let descriptor_limit = libc::rlimit {
+                rlim_cur: 128,
+                rlim_max: 128,
+            };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &descriptor_limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            #[cfg(target_os = "linux")]
+            {
+                let data_limit = libc::rlimit {
+                    rlim_cur: 16 * 1024 * 1024,
+                    rlim_max: 16 * 1024 * 1024,
+                };
+                if libc::setrlimit(libc::RLIMIT_DATA, &data_limit) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
+    let output = command.output().expect("run dry-run with resource limits");
+    assert!(
+        output.status.success(),
+        "dry-run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("dry-run output is UTF-8");
+    let lines = stdout.lines().collect::<Vec<_>>();
+    let mkdir_count = lines.iter().filter(|line| line.starts_with("mkdir\t")).count();
+    let delete_count = lines.iter().filter(|line| line.starts_with("delete\t")).count();
+    let root_updates = lines.iter().filter(|line| **line == "update\t.").count();
+    assert_eq!(mkdir_count, directory_count);
+    assert_eq!(delete_count, directory_count);
+    assert!(root_updates <= 1);
+    assert_eq!(lines.len(), directory_count * 2 + root_updates);
+    assert!(destination.is_dir());
+    assert!(destination.join("stale-0").is_file());
+    assert!(!destination.join("directory-0").exists());
+    assert!(
+        fs::read_dir(fixture.root())
+            .expect("read fixture root")
+            .all(|entry| !entry
+                .expect("read fixture entry")
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".fs.")),
+        "dry-run created a private temporary entry"
+    );
+}
+
+/// Deep dry-run walks switch to name rescans before live directory streams can
+/// exhaust the child process descriptor limit.
+#[cfg(unix)]
+#[test]
+fn sync_dry_run_handles_deep_branching_trees_with_bounded_file_descriptors() {
+    let fixture = Fixture::new();
+    let source = fixture.root().join("source");
+    let destination = fixture.root().join("destination");
+    fs::create_dir(&source).expect("create source");
+    fs::create_dir(&destination).expect("create destination");
+    let mut source_leaf = source.clone();
+    let mut destination_leaf = destination.clone();
+    for _ in 0..96 {
+        fs::create_dir(source_leaf.join("sibling")).expect("create source sibling");
+        fs::create_dir(destination_leaf.join("sibling")).expect("create destination sibling");
+        source_leaf.push("nested");
+        destination_leaf.push("nested");
+        fs::create_dir(&source_leaf).expect("create source nested directory");
+        fs::create_dir(&destination_leaf).expect("create destination nested directory");
+    }
+    fs::write(source_leaf.join("payload"), b"source payload").expect("write source payload");
+    fs::write(destination_leaf.join("stale"), b"stale payload").expect("write stale payload");
+    let relative_leaf = "nested/".repeat(96);
+
+    let mut command = fixture.command();
+    command.args([
+        "sync",
+        "--dry-run",
+        "--no-progress",
+        "-j",
+        "1",
+        "source",
+        "destination",
+    ]);
+    // SAFETY: `pre_exec` runs only in the spawned child before `exec`. The
+    // closure uses the async-signal-safe `setrlimit` syscall and reports a
+    // normal I/O error if the limit cannot be applied.
+    unsafe {
+        command.pre_exec(|| {
+            let limit = libc::rlimit {
+                rlim_cur: 128,
+                rlim_max: 128,
+            };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+    let output = command.output().expect("run deep dry-run with low fd limit");
+    assert!(
+        output.status.success(),
+        "deep dry-run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("dry-run output is UTF-8");
+    assert!(stdout.contains(&format!("copy\t{relative_leaf}payload")));
+    assert!(stdout.contains("delete\tstale"));
+    assert!(!destination_leaf.join("payload").exists());
+    assert!(destination_leaf.join("stale").exists());
+}
+
 /// A deep tree must not turn recursion depth into an open-FD requirement.
 /// Directory work is expected to be bounded independently of tree shape.
 #[cfg(unix)]

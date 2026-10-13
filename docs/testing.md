@@ -16,9 +16,10 @@ Unit tests live beside their implementation. Integration tests cover command
 semantics and modeled trees in [`tests/semantics.rs`](../tests/semantics.rs)
 and [`tests/model.rs`](../tests/model.rs), timestamp behavior in
 [`tests/metadata.rs`](../tests/metadata.rs), race and symlink handling in
-[`tests/symlink_races.rs`](../tests/symlink_races.rs), bounded concurrency and
-descriptor use in [`tests/concurrency.rs`](../tests/concurrency.rs), and
-interruption behavior in [`tests/interruption.rs`](../tests/interruption.rs).
+[`tests/symlink_races.rs`](../tests/symlink_races.rs), bounded concurrency,
+descriptor use, and wide/deep dry-run traversal in
+[`tests/concurrency.rs`](../tests/concurrency.rs), and interruption behavior
+in [`tests/interruption.rs`](../tests/interruption.rs).
 
 The release workflow runs `make test-ci` for each target, using the Dockerfile
 builder for Linux and the host for macOS.

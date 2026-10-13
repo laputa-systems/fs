@@ -6,10 +6,10 @@ not a feature wishlist.
 
 ## Performance evidence
 
-- Extend `scripts/bench.sh` to measure startup, metadata no-op, small and large
-  copies, mixed trees, hash mode, and progress overhead, then record release
-  results. It currently measures population, metadata and hash no-op runs, and
-  a one-file change in a generated flat tree.
+- Run `scripts/bench.sh` on representative macOS and Linux systems and retain
+  release results. It now covers repeated startup, small and large copies,
+  metadata and hash no-op runs, one-file change, mixed trees, and progress when
+  stderr is a terminal.
 - Profile representative macOS and Linux runs for duplicate stats, unnecessary
   opens, FD duplication, queue contention, failed clone attempts, allocations,
   and progress-rendering overhead.
@@ -29,8 +29,6 @@ not a feature wishlist.
 
 - Expand the adversarial symlink, source-mutation, and destination-mutation
   suites into repeated stress runs suitable for release qualification.
-- Bound dry-run buffering for very wide directories without creating a
-  temporary filesystem object.
 - Repeat the existing bounded-FD checks and add a million-entry-scale check
   under representative Linux and macOS resource limits; retain the results.
 - Document the benchmark and platform-validation evidence alongside release
